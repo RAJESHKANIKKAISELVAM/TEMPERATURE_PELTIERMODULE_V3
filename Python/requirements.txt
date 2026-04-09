@@ -1,0 +1,5 @@
+pyserial>=3.5
+minimalmodbus>=2.1
+matplotlib>=3.7
+pillow>=10.0
+reportlab>=4.0

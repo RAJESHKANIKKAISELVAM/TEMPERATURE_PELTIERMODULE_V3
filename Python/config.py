@@ -28,7 +28,7 @@ DEFAULT_I = 3.0       # Max current — PID output is clamped to this value
 # =================================================================
 # NOTE: Starting defaults — NOT yet tuned with real experimental data.
 #       Adjust after open-loop step-response characterisation.
-PID_KP    = 0.30      # Proportional gain  [A / °C]
+PID_KP    = 0.20      # Proportional gain  [A / °C]
 PID_KI    = 0.02      # Integral gain      [A / (°C·s)]
 PID_KD    = 0.50      # Derivative gain    [A / (°C/s)]
 PID_MIN_I = 0.10      # Min output current — below this relay coasts (OFF)
@@ -38,7 +38,7 @@ PID_MIN_I = 0.10      # Min output current — below this relay coasts (OFF)
 # =================================================================
 HOLD_BAND          = 1.0    # ±°C — within this window, HOLDING state begins
 NEAR_BAND          = 3.0    # ±°C — inner approach / brake zone
-MIN_RELAY_FLIP_SEC = 5.0    # Minimum seconds between relay direction changes
+MIN_RELAY_FLIP_SEC = 3.0    # Minimum seconds between relay direction changes
 
 # =================================================================
 #  GUI / LOGGING

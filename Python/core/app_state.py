@@ -14,6 +14,7 @@ Sections:
     Session            — SESSION_DIR, SESSION_START_DT, SESSION_END_DT
     UI widget refs     — set by each ui/ module after widgets are built
     Misc flags         — _SILENT_SAVE, manual_out, reading_count, _hold_artists
+    Prediction state   — pred_braking, pred_flip_count
 """
 
 import threading
@@ -93,6 +94,13 @@ class AppState:
         self._last_update_t = [time.time()]
         self._psu_was_connected = [False]
 
+        # ── Predictive relay flip state ───────────────────────────────
+        # pred_braking    : True on ticks where prediction fired a relay flip
+        # pred_flip_count : total early flips this step (shown in GUI as ×N)
+        # Both reset to zero at start_ctrl() and each _load_step()
+        self.pred_braking    = [False]
+        self.pred_flip_count = [0]
+
         # ── UI widget references (set by ui/ modules after build) ─────
         # live_readings.py
         self.temp_label  = None
@@ -123,16 +131,24 @@ class AppState:
         self.entry_kp     = None
         self.entry_ki     = None
         self.entry_kd     = None
+        # Enhancement diagnostic labels
+        self.pid_mode_lbl  = None
+        self.pid_ff_lbl    = None
+        self.pid_adp_lbl   = None
+        self.pid_rmp_lbl   = None
+        self.entry_kp_heat = None
+        self.entry_ki_heat = None
+        self.entry_kd_heat = None
 
         # auto_controller.py
-        self.state_lbl   = None
-        self.relay_lbl   = None
-        self.zone_lbl    = None
-        self.hold_lbl    = None
-        self.step_lbl    = None
-        self.target_lbl  = None
-        self.btn_start   = None
-        self.btn_stop    = None
+        self.state_lbl    = None
+        self.relay_lbl    = None
+        self.zone_lbl     = None
+        self.hold_lbl     = None
+        self.step_lbl     = None
+        self.target_lbl   = None
+        self.btn_start    = None
+        self.btn_stop     = None
         self.step_entries = []   # list of (target_entry, hold_entry, status_label)
 
         # log_panel.py
@@ -141,23 +157,23 @@ class AppState:
         self.auto_scr = [True]
 
         # graphs.py
-        self.fig         = None
-        self.ax_t        = None
-        self.ax_vi       = None
-        self.ax_vi2      = None
-        self.ax_pid      = None
-        self.mpl_canvas  = None
-        self.line_temp   = None
-        self.line_setp   = None
-        self.line_volt   = None
-        self.line_curr   = None
-        self.line_p      = None
-        self.line_i      = None
-        self.line_d      = None
+        self.fig          = None
+        self.ax_t         = None
+        self.ax_vi        = None
+        self.ax_vi2       = None
+        self.ax_pid       = None
+        self.mpl_canvas   = None
+        self.line_temp    = None
+        self.line_setp    = None
+        self.line_volt    = None
+        self.line_curr    = None
+        self.line_p       = None
+        self.line_i       = None
+        self.line_d       = None
         self.graph_live   = [True]
-        self.graph_window = [300]   # active live window seconds; None = full session
-        self.btn_live    = None
-        self.ani         = None
+        self.graph_window = [300]   # active live window seconds
+        self.btn_live     = None
+        self.ani          = None
 
         # root window — set by lab_monitor.py
         self.root = None

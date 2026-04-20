@@ -7,20 +7,23 @@ Features:
   1. Gain-Scheduled Dual PID  — separate Kp/Ki/Kd for HEAT vs COOL direction
   2. Setpoint Ramp Generator  — smooth intermediate targets, seeded from current temp
   3. Back-calc Anti-Windup    — integral freezes when output saturates
-  4. Adaptive Gain Control    — aggressive far from target, gentle near it
-  5. Feedforward              — pre-emptive current push in correct direction
+  4. Adaptive Gain Control    — aggressive far from final target, gentle near it
+  5. Feedforward              — pre-emptive current push toward final target
+
+Signal separation (the key architectural decision):
+  ramp_error  = current_temp - ramp_target    → P term, I term
+  final_error = current_temp - final_target   → gain selection, adaptive scale, FF
+  dT_dt       = (current_temp - prev_temp)/dt → D term only (ramp-independent)
+
+This separation fixes 3 bugs present in the single-error design:
+  Bug 1: Gain selection by ramp_error flips wrong when temp overshoots ramp
+  Bug 2: Adaptive threshold vs ramp_error never fires (ramp keeps error tiny)
+  Bug 3: Derivative on ramp_error produces fake signal from ramp advancement
 
 Sign convention (unchanged from original):
-  error = current_temp - ramp_target
-  error > 0  → too hot  → COOL → Relay A
-  error < 0  → too cold → HEAT → Relay B
+  final_error > 0  → too hot  → COOL → Relay A
+  final_error < 0  → too cold → HEAT → Relay B
   |output| < min_output → relay OFF (coast)
-
-Bugs fixed vs previous version:
-  - Ramp seeded from current_temp (not 0.0) via set_target(t, current_temp)
-  - FF sign corrected: FF = ff_gain * (current_temp - final_target) [same sign as error]
-  - Adaptive near-scale raised to 1.0 so holding is not sluggish
-  - _load_step in control_loop passes current_temp to set_target()
 """
 
 from config import (
@@ -33,6 +36,11 @@ from config import (
 
 
 class PIDController:
+    """
+    Enhanced PID controller with signal separation, gain scheduling,
+    ramp generator, back-calculation anti-windup, adaptive gain,
+    and feedforward.
+    """
 
     def __init__(self,
                  Kp=0.3,
@@ -42,7 +50,7 @@ class PIDController:
                  min_output=0.1,
                  integral_limit=5.0):
 
-        # Legacy attrs (backward compat)
+        # Legacy attrs (backward compat with app_state.py)
         self.Kp             = Kp
         self.Ki             = Ki
         self.Kd             = Kd
@@ -50,7 +58,7 @@ class PIDController:
         self.min_output     = min_output
         self.integral_limit = integral_limit
 
-        # Feature 1: Dual gain sets (loaded from config, tunable at runtime)
+        # Feature 1: Dual gain sets
         self.Kp_cool = PID_KP_COOL
         self.Ki_cool = PID_KI_COOL
         self.Kd_cool = PID_KD_COOL
@@ -58,18 +66,18 @@ class PIDController:
         self.Ki_heat = PID_KI_HEAT
         self.Kd_heat = PID_KD_HEAT
 
-        # Feature 2: Ramp generator
+        # Feature 2: Ramp generator state
         self._final_target  = 0.0
         self._ramp_target   = 0.0
         self._ramp_active   = False
-        self.ramp_rate      = RAMP_RATE_DEG_PER_SEC   # °C / s
+        self.ramp_rate      = RAMP_RATE_DEG_PER_SEC
 
         # Core PID state
-        self.target         = 0.0    # always mirrors _ramp_target (read externally)
+        self.target         = 0.0
         self._integral      = 0.0
-        self._prev_error    = None
+        self._prev_temp     = None  # previous temperature for real dT/dt
 
-        # Feature 3: Anti-windup flag
+        # Feature 3: Anti-windup saturation flag
         self._was_saturated = False
 
         # Feature 4: Adaptive gain thresholds
@@ -80,7 +88,7 @@ class PIDController:
         # Feature 5: Feedforward gain
         self.ff_gain = FF_GAIN
 
-        # Diagnostics (read by GUI)
+        # Diagnostics
         self.last_P         = 0.0
         self.last_I         = 0.0
         self.last_D         = 0.0
@@ -99,24 +107,14 @@ class PIDController:
 
     def set_target(self, target: float, current_temp: float = None):
         """
-        Set new final setpoint.
-
-        MUST pass current_temp so the ramp generator starts from the actual
-        measured temperature, not from 0.0 or a stale internal value.
-
-        Args:
-            target       : final desired temperature (°C)
-            current_temp : latest measured temperature (°C) — seeds the ramp
+        Set new final setpoint. Always pass current_temp so ramp
+        seeds from actual temperature, not 0.0.
         """
         self._final_target = target
 
-        # Seed ramp from actual current temperature so the ramp direction
-        # matches reality from tick 1. Without this, ramp starts from 0°C
-        # and the error sign is wrong for ~100 seconds.
         if current_temp is not None:
             self._ramp_target = current_temp
         else:
-            # Fallback: if caller forgot, seed from final target (no ramp)
             self._ramp_target = target
 
         self._ramp_active = (
@@ -127,10 +125,10 @@ class PIDController:
     def reset(self):
         """
         Reset integral, derivative memory, and saturation flag.
-        Does NOT touch ramp state — ramp is already seeded by set_target().
+        Does NOT touch ramp state.
         """
         self._integral      = 0.0
-        self._prev_error    = None
+        self._prev_temp     = None
         self._was_saturated = False
         self.last_P         = 0.0
         self.last_I         = 0.0
@@ -142,17 +140,17 @@ class PIDController:
 
     def compute(self, current_temp: float, dt: float = 1.0):
         """
-        Compute PID output for one tick.
+        Compute one PID tick.
 
         Returns:
             (current_A, direction)
-            current_A  : PSU current magnitude to set (A)
-            direction  : "A" (cool) | "B" (heat) | "OFF" (coast)
+            current_A : PSU current magnitude (A)
+            direction : 'A' (cool) | 'B' (heat) | 'OFF' (coast)
         """
         if dt <= 0:
             dt = 1.0
 
-        # ── Feature 2: Advance ramp toward final target ───────────────
+        # ── Feature 2: Advance ramp ───────────────────────────────────
         if self._ramp_active:
             step = self.ramp_rate * dt
             diff = self._final_target - self._ramp_target
@@ -162,74 +160,73 @@ class PIDController:
             else:
                 self._ramp_target += step if diff > 0 else -step
 
-        # Update public .target so external code (graphs, hold detection)
-        # always sees the correct intermediate target
         self.target         = self._ramp_target
         self.last_ramp_tgt  = round(self._ramp_target, 3)
         self.ramp_remaining = round(
             abs(self._final_target - self._ramp_target), 3)
 
-        # ── Error: positive = too hot, negative = too cold ────────────
-        error           = current_temp - self.target
-        self.last_error = error
+        # ── Signal separation ─────────────────────────────────────────
+        ramp_error  = current_temp - self._ramp_target   # P, I
+        final_error = current_temp - self._final_target  # gain select, adaptive, FF
 
-        # ── Feature 1: Select gain set by error sign ──────────────────
-        if error > 0:
-            # Temperature above ramp target → need to COOL
+        # Real temperature rate — ramp movement does NOT contaminate this
+        if self._prev_temp is not None:
+            dT_dt = (current_temp - self._prev_temp) / dt
+        else:
+            dT_dt = 0.0
+        self._prev_temp  = current_temp
+        self.last_dT_dt  = dT_dt
+        self.last_error  = ramp_error   # GUI shows ramp tracking error
+
+        # ── Feature 1: Gain selection by final_error ──────────────────
+        # Stable signal — never flips incorrectly when temp overshoots ramp
+        if final_error > 0:
             Kp, Ki, Kd     = self.Kp_cool, self.Ki_cool, self.Kd_cool
             self.last_mode = "COOL"
         else:
-            # Temperature below ramp target → need to HEAT
             Kp, Ki, Kd     = self.Kp_heat, self.Ki_heat, self.Kd_heat
             self.last_mode = "HEAT"
 
-        # ── Feature 4: Adaptive gain scale ────────────────────────────
-        # Far from target: scale up for fast approach
-        # Near target: stays at 1.0 for stable holding (no reduction)
-        abs_err = abs(error)
-        if abs_err >= self.adaptive_far_threshold:
+        # ── Feature 4: Adaptive scale by |final_error| ───────────────
+        # Now fires correctly — 11°C from setpoint gives FAR boost
+        # Previously abs_err was 0-0.5 with ramp, boost never triggered
+        abs_final = abs(final_error)
+        if abs_final >= self.adaptive_far_threshold:
             adaptive_scale = self.adaptive_far_scale
         else:
-            frac = abs_err / max(self.adaptive_far_threshold, 0.001)
+            frac = abs_final / max(self.adaptive_far_threshold, 0.001)
             adaptive_scale = (
                 self.adaptive_near_scale +
                 frac * (self.adaptive_far_scale - self.adaptive_near_scale)
             )
         self.last_adaptive = round(adaptive_scale, 3)
-
-        # Scale Kp and Kd only — Ki kept constant for integral consistency
         Kp = Kp * adaptive_scale
-        Kd = Kd * adaptive_scale
+        Kd = Kd * adaptive_scale   # Ki NOT scaled — keeps integral consistent
 
-        # ── Proportional ──────────────────────────────────────────────
-        P = Kp * error
+        # ── P on ramp_error ───────────────────────────────────────────
+        P = Kp * ramp_error
 
-        # ── Feature 3: Anti-windup — freeze integral when saturated ───
+        # ── Feature 3: Anti-windup ────────────────────────────────────
         if not self._was_saturated:
-            self._integral += error * dt
-
-        # Absolute clamp as secondary guard
+            self._integral += ramp_error * dt
         self._integral = max(-self.integral_limit,
                              min(self.integral_limit, self._integral))
         I = Ki * self._integral
 
-        # ── Derivative on error ───────────────────────────────────────
-        if self._prev_error is not None:
-            dE_dt = (error - self._prev_error) / dt
-        else:
-            dE_dt = 0.0
-        D = Kd * dE_dt
-        self.last_dT_dt = dE_dt
+        # ── D on real dT_dt ───────────────────────────────────────────
+        # dT_dt > 0 → temp rising → D > 0 → pushes cooling ✓
+        # dT_dt < 0 → temp falling → D < 0 → pushes heating ✓
+        # Frozen temp → dT_dt = 0 → D = 0 ✓ (no fake signal)
+        D = Kd * dT_dt
 
         self.last_P = round(P, 4)
         self.last_I = round(I, 4)
         self.last_D = round(D, 4)
 
-        # ── Feature 5: Feedforward ────────────────────────────────────
-        # FF has the SAME sign as error:
-        #   heating needed (error < 0): FF = ff_gain*(current-final) < 0 ✓
-        #   cooling needed (error > 0): FF = ff_gain*(current-final) > 0 ✓
-        ff_raw     = self.ff_gain * (current_temp - self._final_target)
+        # ── Feature 5: Feedforward on final_error ─────────────────────
+        # final_error > 0 → FF > 0 → pushes cooling ✓
+        # final_error < 0 → FF < 0 → pushes heating ✓
+        ff_raw     = self.ff_gain * final_error
         ff_clamped = max(-self.max_output, min(self.max_output, ff_raw))
         self.last_ff = round(ff_clamped, 4)
 
@@ -237,10 +234,9 @@ class PIDController:
         raw_output       = P + I + D + ff_clamped
         self.last_output = round(raw_output, 4)
 
-        self._prev_error    = error
         self._was_saturated = abs(raw_output) >= self.max_output
 
-        # ── Map to current magnitude + relay direction ────────────────
+        # ── Map to current + direction ────────────────────────────────
         current_A = min(abs(raw_output), self.max_output)
         current_A = round(current_A, 3)
 
@@ -273,7 +269,7 @@ class PIDController:
     # =================================================================
 
     def get_diagnostics(self) -> dict:
-        """Backward-compatible diagnostics dict — original keys unchanged."""
+        """Backward-compatible diagnostics — original keys unchanged."""
         return {
             # Original keys
             "Kp":             self.Kp_cool,
@@ -285,7 +281,7 @@ class PIDController:
             "D":              self.last_D,
             "dT_dt":          round(self.last_dT_dt, 4),
             "output":         self.last_output,
-            # New keys
+            # Enhancement keys
             "ff":             self.last_ff,
             "mode":           self.last_mode,
             "adaptive":       self.last_adaptive,

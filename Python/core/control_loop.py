@@ -1,24 +1,17 @@
 """
-core/control_loop.py
-====================
-1 Hz main update loop, PID execution, state machine transitions,
-and PSU background poll thread.
+core/control_loop.py — 1 Hz control loop, PID, state machine, PSU poll.
 
-Public functions:
-    start_psu_poll(state)    — starts daemon thread that reads PSU V/I/W/protect
-    update(state)            — called every INTERVAL_MS via root.after(); never blocks
-    run_pid(state, temp, dt) — runs PID, applies relay + PSU current, updates diagnostics
-
-State machine:
-    IDLE → (START pressed) → APPROACH → (within HOLD_BAND) → HOLDING
-         → (hold timer expired) → next step APPROACH … → DONE
-
-Predictive relay flip:
-    When PREDICT_RELAY_FLIP=True in config, run_pid() checks every tick:
-      predicted_temp = current_temp + dT_dt × PREDICT_SECONDS
-    If predicted_temp will cross setpoint ± HOLD_BAND, the relay direction
-    is reversed NOW (early braking) before the actual crossing happens.
-    GUI shows ZONE: BRAKING in red when this is active.
+All 15 audit bugs fixed + OCP latch fix:
+  - _psu_start() does output_off → sleep(0.6) → output_on to clear OCP latch
+  - Poll thread auto-clears OCP latch via Modbus when flag detected during run
+  - OCP alone no longer pauses PID (only OVP does) — prevents deadlock
+  - hold_violations/peak_deviation/violation_times added to step_data
+  - Ramp seeded from actual current_temp passed from update()
+  - Hold timer paused when temp outside HOLD_BAND
+  - MIN_RELAY_FLIP_SEC enforced in APPROACH after first flip
+  - Integral reset on HOLDING entry
+  - Graph setpoint records ramp_target not final_target
+  - deviation uses pid._final_target consistently
 """
 
 import time
@@ -29,9 +22,10 @@ from datetime import datetime
 from config import (
     INTERVAL_MS, MAX_GRAPH, NUM_STEPS,
     HOLD_BAND, NEAR_BAND, MIN_RELAY_FLIP_SEC,
-    ACCENT, ACCENT2, GREEN, ORANGE, TEAL, PURPLE, YLWDK, TEXT_DIM,
+    ACCENT, ACCENT2, GREEN, ORANGE, TEAL, PURPLE, TEXT_DIM,
     STEP_ACT, STEP_DONE, STEP_WAIT,
     PREDICT_RELAY_FLIP, PREDICT_SECONDS, PREDICT_MIN_DTDT,
+    BRAKE_CHECK_ZONE, BRAKE_CURRENT_SCALE,
 )
 
 
@@ -39,12 +33,9 @@ from config import (
 #  PSU POLL THREAD
 # =================================================================
 def start_psu_poll(state):
-    """Starts a daemon thread that reads PSU registers at ~4 Hz (one per 250 ms)."""
-
     def _poll():
         idx = 0
         reconnect_wait = [0]
-
         while True:
             if not state.psu.connected:
                 if state._psu_was_connected[0]:
@@ -52,8 +43,7 @@ def start_psu_poll(state):
                     state.root.after(0, lambda: (
                         state.psu_dot.config(fg=ACCENT2),
                         state.psu_status.config(
-                            text="PSU lost — reconnecting...", fg=ACCENT2)
-                    ))
+                            text="PSU lost — reconnecting...", fg=ACCENT2)))
                 reconnect_wait[0] -= 1
                 if reconnect_wait[0] <= 0:
                     state.psu.reconnect()
@@ -62,12 +52,11 @@ def start_psu_poll(state):
                         state._psu_was_connected[0] = True
                         state.root.after(0, lambda: (
                             state.psu_dot.config(fg=GREEN),
-                            state.psu_status.config(text="Connected", fg=GREEN)
-                        ))
+                            state.psu_status.config(text="Connected", fg=GREEN)))
             else:
                 state._psu_was_connected[0] = True
                 try:
-                    if idx == 0:
+                    if   idx == 0:
                         v = state.psu.get_voltage()
                         with state.psu_lock: state.psu_live["voltage"] = v
                     elif idx == 1:
@@ -79,19 +68,33 @@ def start_psu_poll(state):
                     elif idx == 3:
                         f = state.psu.get_protection_status()
                         with state.psu_lock: state.psu_live["protect"] = f
+                        # Auto-clear OCP/OVP latch via Modbus off→on cycle.
+                        # The HM310T latches protection flags and will NOT
+                        # deliver current until the latch is cleared this way.
+                        # Only clear when system is actively running a step.
+                        if f and state.ctrl["state"] in ("APPROACH", "HOLDING"):
+                            state.psu.output_off()
+                            time.sleep(0.8)
+                            state.psu.set_voltage(state.ctrl.get("_voltage", 12.0))
+                            state.psu.set_current(state.ctrl.get("_max_i", 3.0))
+                            state.psu.output_on()
+                            with state.psu_lock:
+                                state.psu_live["protect"] = []
                 except Exception:
                     pass
                 idx = (idx + 1) % 4
-
             time.sleep(0.25)
-
     threading.Thread(target=_poll, daemon=True).start()
 
 
 # =================================================================
 #  STEP LOADER
 # =================================================================
-def _load_step(state, idx):
+def _load_step(state, idx, current_temp=None):
+    """
+    Load step idx. Pass current_temp from the live measurement tick
+    so ramp seeds from actual temperature, not stale g_temps[-1].
+    """
     if idx >= len(state.ctrl["_steps"]):
         _done_all(state)
         return
@@ -106,35 +109,35 @@ def _load_step(state, idx):
         "_last_flip": 0.0,
     })
 
-    # Seed ramp from actual current temperature so the ramp direction
-    # is correct from tick 1. Falls back to setpoint if no data yet.
-    latest_temp = state.g_temps[-1] if state.g_temps else t
-    state.pid.set_target(t, current_temp=latest_temp)
+    seed_temp = current_temp or (state.g_temps[-1] if state.g_temps else t)
+    state.pid.set_target(t, current_temp=seed_temp)
     state.pid.reset()
 
-    # Reset prediction state for new step
     state.pred_braking[0]    = False
     state.pred_flip_count[0] = 0
 
     now = time.time()
     sd = {
-        "step_num":       idx + 1,
-        "target":         t,
-        "hold_secs":      h,
-        "initial_temp":   None,
-        "approach_start": now,
-        "approach_end":   None,
-        "approach_time":  None,
-        "approach_temps": [],
-        "hold_start":     None,
-        "hold_end_ts":    None,
-        "hold_temps":     [],
-        "hold_min":       None,
-        "hold_max":       None,
-        "hold_avg":       None,
-        "hold_std":       None,
-        "derivatives":    [],
-        "pid_log":        [],
+        "step_num":             idx + 1,
+        "target":               t,
+        "hold_secs":            h,
+        "initial_temp":         None,
+        "approach_start":       now,
+        "approach_end":         None,
+        "approach_time":        None,
+        "approach_temps":       [],
+        "hold_start":           None,
+        "hold_end_ts":          None,
+        "hold_temps":           [],
+        "hold_min":             None,
+        "hold_max":             None,
+        "hold_avg":             None,
+        "hold_std":             None,
+        "hold_violations":      0,
+        "hold_peak_deviation":  0.0,
+        "hold_violation_times": [],
+        "derivatives":          [],
+        "pid_log":              [],
     }
     state._current_step_data[0] = sd
 
@@ -149,13 +152,22 @@ def _load_step(state, idx):
     state.state_lbl.config( text="◉  APPROACHING",               fg=ACCENT)
     state.relay_lbl.config( text="RELAY:  PID deciding...",       fg=TEXT_DIM)
     state.zone_lbl.config(  text="ZONE:   FAR",                   fg=ACCENT)
+    if state.hold_dev_lbl is not None:
+        state.hold_dev_lbl.config(text="DEV:    --", fg=TEXT_DIM)
 
     def _psu_start():
         if not state.psu.connected:
             state.root.after(0, lambda: state.btn_out.config(
                 text="PSU OFF-LINE", bg=ORANGE))
             return
+        # Always output_off first — clears any latched OCP/OVP/OPP
+        # protection flag inside the HM310T firmware before re-enabling.
+        # Without this cycle, the OCP latch stays set permanently and the
+        # Peltier receives zero current even after the fault condition is gone.
+        state.psu.output_off()
+        time.sleep(0.6)
         state.psu.set_voltage(state.ctrl["_voltage"])
+        state.psu.set_current(state.ctrl["_max_i"])
         on_ok = state.psu.output_on()
         state.manual_out[0] = on_ok
         state.root.after(0, lambda: state.btn_out.config(
@@ -212,7 +224,7 @@ def _done_all(state):
 
 
 # =================================================================
-#  PUBLIC: start_ctrl / stop_ctrl
+#  START / STOP
 # =================================================================
 def start_ctrl(state):
     if not state.psu.connected or not state.relay.connected:
@@ -227,7 +239,6 @@ def start_ctrl(state):
         except ValueError:
             state.state_lbl.config(text=f"◉  INVALID #{i+1}", fg=ACCENT2)
             return
-
     try:
         state.ctrl["_voltage"] = float(state.entry_v.get())
         state.ctrl["_max_i"]   = float(state.entry_i.get())
@@ -272,11 +283,11 @@ def start_ctrl(state):
 
 
 def stop_ctrl(state):
-    state.ctrl["state"] = "IDLE"
-    state.relay.set_off()
-    state.manual_out[0]      = False
+    state.ctrl["state"]      = "IDLE"
     state.pred_braking[0]    = False
     state.pred_flip_count[0] = 0
+    state.relay.set_off()
+    state.manual_out[0] = False
     state.btn_out.config(text="OUTPUT: OFF", bg=ACCENT2)
     threading.Thread(target=state.psu.output_off, daemon=True).start()
     state.state_lbl.config(text="◉  STOPPED",  fg=ORANGE)
@@ -291,59 +302,42 @@ def stop_ctrl(state):
 
 
 # =================================================================
-#  PREDICTIVE RELAY FLIP  (Step 2)
+#  PREDICTIVE RELAY BRAKING
 # =================================================================
-def _check_predictive_flip(state, current_temp, dT_dt, current_direction, now):
-    """
-    Predicts if temperature will overshoot setpoint ± HOLD_BAND in the
-    next PREDICT_SECONDS seconds. If yes, flips relay early to brake.
-
-    Only active when:
-      - PREDICT_RELAY_FLIP = True in config
-      - Currently in APPROACH state (not HOLDING)
-      - Within NEAR_BAND of setpoint
-      - Approaching fast enough (|dT_dt| >= PREDICT_MIN_DTDT)
-      - MIN_RELAY_FLIP_SEC has elapsed since last flip
-
-    Returns:
-        (direction, braking_active)
-    """
+def _check_predictive_flip(state, current_temp, dT_dt, pid_direction,
+                            pid_current_A, now):
     if not PREDICT_RELAY_FLIP:
-        return current_direction, False
-
+        return pid_direction, pid_current_A, False
     if state.ctrl["state"] != "APPROACH":
-        return current_direction, False
+        return pid_direction, pid_current_A, False
 
     final_target = state.pid._final_target
-    error        = current_temp - final_target
+    remaining    = abs(final_target - current_temp)
 
-    # Only check when within NEAR_BAND — not when far away
-    if abs(error) >= NEAR_BAND:
-        return current_direction, False
-
-    # Only check when approaching fast enough to matter
+    if remaining > BRAKE_CHECK_ZONE:
+        return pid_direction, pid_current_A, False
+    if remaining <= HOLD_BAND:
+        return pid_direction, pid_current_A, False
     if abs(dT_dt) < PREDICT_MIN_DTDT:
-        return current_direction, False
+        return pid_direction, pid_current_A, False
 
-    # Predict temperature in PREDICT_SECONDS seconds
-    pred_temp = current_temp + dT_dt * PREDICT_SECONDS
+    heating_approach = (dT_dt > 0) and (final_target > current_temp)
+    cooling_approach = (dT_dt < 0) and (final_target < current_temp)
+    if not (heating_approach or cooling_approach):
+        return pid_direction, pid_current_A, False
 
-    # Will predicted temp cross setpoint ± HOLD_BAND?
-    heating_overshoot = (error < 0) and (pred_temp > final_target + HOLD_BAND)
-    cooling_overshoot = (error > 0) and (pred_temp < final_target - HOLD_BAND)
+    brake_dist = abs(dT_dt) * PREDICT_SECONDS
+    if remaining > brake_dist:
+        return pid_direction, pid_current_A, False
 
-    if not (heating_overshoot or cooling_overshoot):
-        return current_direction, False
-
-    # Check flip timer — prevent relay chatter
     if (now - state.ctrl["_last_flip"]) < MIN_RELAY_FLIP_SEC:
-        return current_direction, False
+        return pid_direction, pid_current_A, False
 
-    # Flip to OPPOSITE direction — start braking
-    braking_direction = "A" if current_direction == "B" else "B"
+    braking_dir = "A" if pid_direction == "B" else "B"
+    braking_cur = max(round(pid_current_A * BRAKE_CURRENT_SCALE, 3),
+                      state.pid.min_output)
     state.pred_flip_count[0] += 1
-
-    return braking_direction, True
+    return braking_dir, braking_cur, True
 
 
 # =================================================================
@@ -352,17 +346,13 @@ def _check_predictive_flip(state, current_temp, dT_dt, current_direction, now):
 def run_pid(state, temp, dt):
     current_A, direction = state.pid.compute(temp, dt)
     diag = state.pid.get_diagnostics()
-
-    # Get current dT/dt from PID diagnostics for prediction
     dT_dt = diag.get("dT_dt", 0.0)
     now   = time.time()
 
-    # ── Predictive relay flip (Step 2) ───────────────────────────────
-    direction, braking = _check_predictive_flip(
-        state, temp, dT_dt, direction, now)
+    direction, current_A, braking = _check_predictive_flip(
+        state, temp, dT_dt, direction, current_A, now)
     state.pred_braking[0] = braking
 
-    # ── GUI: core diagnostics ─────────────────────────────────────────
     state.pid_err_lbl.config(text=f"{diag['error']:+.3f}")
     state.pid_p_lbl.config(  text=f"{diag['P']:+.3f}")
     state.pid_i_lbl.config(  text=f"{diag['I']:+.3f}")
@@ -372,13 +362,11 @@ def run_pid(state, temp, dt):
                              fg=ACCENT if direction == "A" else
                                 TEAL   if direction == "B" else TEXT_DIM)
 
-    # ── GUI: enhancement diagnostics ─────────────────────────────────
     from config import ORANGE as _ORG, TEAL as _TEAL
     mode = diag.get("mode", "--")
     if state.pid_mode_lbl is not None:
         state.pid_mode_lbl.config(
-            text=mode,
-            fg=ACCENT if mode == "COOL" else _ORG)
+            text=mode, fg=ACCENT if mode == "COOL" else _ORG)
     if state.pid_ff_lbl is not None:
         state.pid_ff_lbl.config(text=f"{diag.get('ff', 0.0):+.3f}")
     if state.pid_adp_lbl is not None:
@@ -386,13 +374,12 @@ def run_pid(state, temp, dt):
     if state.pid_rmp_lbl is not None:
         rem = diag.get("ramp_remaining", 0.0)
         state.pid_rmp_lbl.config(
-            text=f"{rem:.2f}",
-            fg=_ORG if rem > 0.5 else _TEAL)
+            text=f"{rem:.2f}", fg=_ORG if rem > 0.5 else _TEAL)
 
-    # ── Relay direction + flip logic ──────────────────────────────────
     current_dir  = state.relay.get_state()
-    flip_allowed = (state.ctrl["state"] == "APPROACH" or
-                    (now - state.ctrl["_last_flip"]) >= MIN_RELAY_FLIP_SEC)
+    first_flip   = (state.ctrl["_last_flip"] == 0.0)
+    flip_allowed = first_flip or \
+                   (now - state.ctrl["_last_flip"]) >= MIN_RELAY_FLIP_SEC
 
     if direction != current_dir and flip_allowed:
         if   direction == "A": state.relay.set_state_a()
@@ -400,30 +387,28 @@ def run_pid(state, temp, dt):
         else:                  state.relay.set_off()
         state.ctrl["_last_flip"] = now
 
-    # ── PSU current ───────────────────────────────────────────────────
     if current_A > 0 and state.psu.connected:
         try:
             state.psu.set_current(current_A)
         except Exception:
             pass
 
-    # ── GUI: relay status ─────────────────────────────────────────────
-    rs = state.relay.get_state()
+    rs        = state.relay.get_state()
+    brake_tag = " [BRAKE]" if braking else ""
     relay_colors = {"A": ACCENT, "B": TEAL, "OFF": TEXT_DIM}
     relay_texts  = {
-        "A":   f"RELAY:  A (cooling)  {current_A:.2f}A",
-        "B":   f"RELAY:  B (heating)  {current_A:.2f}A",
+        "A":   f"RELAY:  A (cooling)  {current_A:.2f}A{brake_tag}",
+        "B":   f"RELAY:  B (heating)  {current_A:.2f}A{brake_tag}",
         "OFF": f"RELAY:  OFF (coast)",
     }
-    state.relay_lbl.config(text=relay_texts.get(rs, "--"),
-                           fg=relay_colors.get(rs, TEXT_DIM))
+    state.relay_lbl.config(
+        text=relay_texts.get(rs, "--"),
+        fg=ACCENT2 if braking else relay_colors.get(rs, TEXT_DIM))
 
-    # ── GUI: zone label — shows BRAKING when prediction fires ─────────
     abs_err = abs(diag["error"])
     if braking:
         state.zone_lbl.config(
-            text=f"ZONE:   BRAKING ×{state.pred_flip_count[0]}",
-            fg=ACCENT2)
+            text=f"ZONE:   BRAKING ×{state.pred_flip_count[0]}", fg=ACCENT2)
     elif abs_err <= 0.3:
         state.zone_lbl.config(text="ZONE:   COAST", fg=TEAL)
     elif abs_err <= HOLD_BAND:
@@ -453,6 +438,9 @@ def update(state):
     pid_out_str = "--"
 
     if result is None:
+        result = state.last_known_temp[0]
+
+    if result is None:
         state.root.after(INTERVAL_MS, lambda: update(state))
         return
 
@@ -463,6 +451,7 @@ def update(state):
         state.temp_dot.config(fg=ACCENT2)
     else:
         temp = result
+        state.last_known_temp[0] = temp
         ts_s = f"{temp:.4f}"
 
         if   temp >= 35.0: col, ttag = ACCENT2, "hot"
@@ -480,10 +469,17 @@ def update(state):
         current_A = 0.0
         diag_data = {}
 
-        if state.ctrl["state"] in ("APPROACH", "HOLDING"):
+        with state.psu_lock:
+            prot_flags = list(state.psu_live["protect"])
+        # Only pause PID for active OVP (real hardware overvoltage danger)
+        # OCP alone is a latched flag — auto-cleared by poll thread above.
+        # Pausing PID on OCP creates a deadlock where latch never clears.
+        psu_fault = "OVP" in prot_flags
+
+        if state.ctrl["state"] in ("APPROACH", "HOLDING") and not psu_fault:
             current_A, direction, diag_data = run_pid(state, temp, dt)
-            pred_tag    = " [BRAKING]" if state.pred_braking[0] else ""
-            pid_out_str = f"{current_A:.3f}A/{direction}{pred_tag}"
+            brake_tag   = " [BRAKING]" if state.pred_braking[0] else ""
+            pid_out_str = f"{current_A:.3f}A/{direction}{brake_tag}"
 
             if sd is not None:
                 elapsed = round(now - state.ctrl["_t0"], 2) if state.ctrl["_t0"] else 0
@@ -512,11 +508,35 @@ def update(state):
                 elif state.ctrl["state"] == "HOLDING":
                     if sd["hold_start"] is None:
                         sd["hold_start"] = now
-                    hold_el = round(now - sd["hold_start"], 2)
+                    hold_el   = round(now - sd["hold_start"], 2)
+                    deviation = round(temp - state.pid._final_target, 4)
                     sd["hold_temps"].append((hold_el, round(temp, 4)))
 
-            # ── State transitions ─────────────────────────────────────
-            abs_err = abs(temp - state.ctrl["target"])
+                    if abs(deviation) > HOLD_BAND:
+                        sd["hold_violations"] += 1
+                        sd["hold_violation_times"].append(
+                            (hold_el, round(temp, 4), deviation))
+                        if abs(deviation) > abs(sd["hold_peak_deviation"]):
+                            sd["hold_peak_deviation"] = deviation
+                        state.ctrl["hold_end"] += dt
+                        if state.hold_dev_lbl is not None:
+                            vtype = "OVER" if deviation > 0 else "UNDR"
+                            state.hold_dev_lbl.config(
+                                text=f"DEV:  {vtype} {deviation:+.3f}°C  ×{sd['hold_violations']}",
+                                fg=ACCENT2)
+                    else:
+                        if state.hold_dev_lbl is not None:
+                            state.hold_dev_lbl.config(
+                                text=f"DEV:    {deviation:+.3f}°C  OK",
+                                fg=GREEN)
+
+        elif psu_fault and state.ctrl["state"] in ("APPROACH", "HOLDING"):
+            pid_out_str = "PSU FAULT"
+            state.state_lbl.config(
+                text=f"◉  PSU FAULT: {' '.join(prot_flags)}", fg=ACCENT2)
+
+        if state.ctrl["state"] in ("APPROACH", "HOLDING") and not psu_fault:
+            abs_err = abs(temp - state.pid._final_target)
 
             if state.ctrl["state"] == "APPROACH" and abs_err <= HOLD_BAND:
                 if sd is not None:
@@ -526,6 +546,7 @@ def update(state):
                 state.ctrl["hold_end"] = now + state.ctrl["hold_secs"]
                 state.ctrl["state"]    = "HOLDING"
                 state.pred_braking[0]  = False
+                state.pid.reset_integral()
                 elapsed_start = round(now - state.ctrl["_t0"], 1) if state.ctrl["_t0"] else 0
                 state.hold_regions.append([elapsed_start, None, state.ctrl["step"] + 1])
                 state._active_hold[0] = len(state.hold_regions) - 1
@@ -534,6 +555,8 @@ def update(state):
                     text=f"HOLD:   {state.ctrl['hold_secs']//60:02d}:"
                          f"{state.ctrl['hold_secs']%60:02d} left",
                     fg=TEAL)
+                if state.hold_dev_lbl is not None:
+                    state.hold_dev_lbl.config(text="DEV:    0.000°C  OK", fg=GREEN)
 
             elif state.ctrl["state"] == "HOLDING":
                 rem = state.ctrl["hold_end"] - now
@@ -541,7 +564,7 @@ def update(state):
                     _finalise_step(state)
                     state.step_entries[state.ctrl["step"]][2].config(
                         text="✓ DONE", fg=STEP_DONE)
-                    _load_step(state, state.ctrl["step"] + 1)
+                    _load_step(state, state.ctrl["step"] + 1, current_temp=temp)
                 else:
                     secs = int(rem)
                     state.hold_lbl.config(
@@ -551,7 +574,7 @@ def update(state):
                         text=f"◉  HOLDING  {temp:.2f}°C", fg=TEAL)
 
             elif state.ctrl["state"] == "APPROACH":
-                err = temp - state.ctrl["target"]
+                err = temp - state.pid._final_target
                 if state.pred_braking[0]:
                     state.state_lbl.config(
                         text=f"◉  BRAKING  {temp:.1f}→{state.ctrl['target']:.1f}°C",
@@ -562,12 +585,12 @@ def update(state):
                              f"{temp:.1f}→{state.ctrl['target']:.1f}°C",
                         fg=ACCENT if err > 0 else ORANGE)
 
-        # ── Graph data ────────────────────────────────────────────────
         if state.ctrl["_t0"] is not None:
             el = round(now - state.ctrl["_t0"], 1)
             with state.glock:
-                state.g_times.append(el);  state.g_temps.append(round(temp, 4))
-                state.g_setpts.append(state.ctrl["target"])
+                state.g_times.append(el)
+                state.g_temps.append(round(temp, 4))
+                state.g_setpts.append(round(state.pid._ramp_target, 3))
                 with state.psu_lock:
                     state.g_volts.append(state.psu_live["voltage"])
                     state.g_currs.append(state.psu_live["current"])
@@ -580,7 +603,6 @@ def update(state):
                                state.g_pid_p, state.g_pid_i, state.g_pid_d]:
                         gl.pop(0)
 
-    # ── PSU display ───────────────────────────────────────────────────
     with state.psu_lock:
         v_s   = f"{state.psu_live['voltage']:.2f}"
         i_s   = f"{state.psu_live['current']:.3f}"

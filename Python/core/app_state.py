@@ -5,16 +5,9 @@ AppState — single object that holds ALL shared state for the application.
 
 Every module receives an AppState instance. Nothing is a bare global.
 
-Sections:
-    Hardware objects   — psu, relay, pid
-    Control state      — ctrl dict (IDLE/APPROACH/HOLDING/DONE, step, target …)
-    Graph data         — g_times, g_temps, g_setpts, g_volts, g_currs, g_pid_*
-    PSU live readings  — psu_live dict + psu_lock
-    Research data      — step_data, _current_step_data, hold_regions, _active_hold
-    Session            — SESSION_DIR, SESSION_START_DT, SESSION_END_DT
-    UI widget refs     — set by each ui/ module after widgets are built
-    Misc flags         — _SILENT_SAVE, manual_out, reading_count, _hold_artists
-    Prediction state   — pred_braking, pred_flip_count
+Changes from audit:
+  - last_known_temp added (Bug 14 fix — reuse last reading if buffer empty)
+  - hold_dev_lbl added (deviation display during HOLDING)
 """
 
 import threading
@@ -76,10 +69,9 @@ class AppState:
         self._current_step_data = [None]
 
         # Hold region markers for temperature graph shading
-        # Each entry: [elapsed_start, elapsed_end_or_None, step_num]
         self.hold_regions  = []
-        self._active_hold  = [None]   # index into hold_regions
-        self._hold_artists = []       # (span_patch, vline_s, vline_e, text)
+        self._active_hold  = [None]
+        self._hold_artists = []
 
         # ── Session ───────────────────────────────────────────────────
         self.SESSION_DIR      = [None]
@@ -87,21 +79,24 @@ class AppState:
         self.SESSION_END_DT   = [None]
 
         # ── Misc flags ────────────────────────────────────────────────
-        self._SILENT_SAVE   = [False]
-        self.manual_out     = [False]
-        self.reading_count  = [0]
-        self.log_rows       = []
-        self._last_update_t = [time.time()]
+        self._SILENT_SAVE       = [False]
+        self.manual_out         = [False]
+        self.reading_count      = [0]
+        self.log_rows           = []
+        self._last_update_t     = [time.time()]
         self._psu_was_connected = [False]
 
-        # ── Predictive relay flip state ───────────────────────────────
-        # pred_braking    : True on ticks where prediction fired a relay flip
-        # pred_flip_count : total early flips this step (shown in GUI as ×N)
-        # Both reset to zero at start_ctrl() and each _load_step()
+        # Bug 14 fix: cache last valid temperature reading
+        # Used when Arduino serial buffer is empty (no new line yet)
+        # Prevents entire 1Hz tick being skipped due to empty buffer
+        self.last_known_temp = [None]
+
+        # Predictive relay flip state
         self.pred_braking    = [False]
         self.pred_flip_count = [0]
 
-        # ── UI widget references (set by ui/ modules after build) ─────
+        # ── UI widget references ──────────────────────────────────────
+
         # live_readings.py
         self.temp_label  = None
         self.temp_status = None
@@ -121,17 +116,16 @@ class AppState:
         self.btn_out    = None
 
         # pid_panel.py
-        self.pid_err_lbl  = None
-        self.pid_p_lbl    = None
-        self.pid_i_lbl    = None
-        self.pid_d_lbl    = None
-        self.pid_out_lbl  = None
-        self.pid_dir_lbl  = None
-        self.pid_tune_lbl = None
-        self.entry_kp     = None
-        self.entry_ki     = None
-        self.entry_kd     = None
-        # Enhancement diagnostic labels
+        self.pid_err_lbl   = None
+        self.pid_p_lbl     = None
+        self.pid_i_lbl     = None
+        self.pid_d_lbl     = None
+        self.pid_out_lbl   = None
+        self.pid_dir_lbl   = None
+        self.pid_tune_lbl  = None
+        self.entry_kp      = None
+        self.entry_ki      = None
+        self.entry_kd      = None
         self.pid_mode_lbl  = None
         self.pid_ff_lbl    = None
         self.pid_adp_lbl   = None
@@ -145,11 +139,12 @@ class AppState:
         self.relay_lbl    = None
         self.zone_lbl     = None
         self.hold_lbl     = None
+        self.hold_dev_lbl = None   # deviation label during HOLDING
         self.step_lbl     = None
         self.target_lbl   = None
         self.btn_start    = None
         self.btn_stop     = None
-        self.step_entries = []   # list of (target_entry, hold_entry, status_label)
+        self.step_entries = []
 
         # log_panel.py
         self.log_box  = None
@@ -171,7 +166,7 @@ class AppState:
         self.line_i       = None
         self.line_d       = None
         self.graph_live   = [True]
-        self.graph_window = [300]   # active live window seconds
+        self.graph_window = [300]
         self.btn_live     = None
         self.ani          = None
 

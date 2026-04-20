@@ -2,19 +2,18 @@
 ui/pid_panel.py
 ===============
 Card 3 — PID Controller Live Diagnostics + Tuning.
+Single PID — dual gain rows removed.
 
-Row 1 : live P / I / D / error / output / direction   (original)
-Row 2 : mode (HEAT/COOL) / FF / adaptive / ramp       (new)
-Row 3 : COOL gain entry fields
-Row 4 : HEAT gain entry fields + APPLY PID button
+Row 1 : ERROR / P / I / D / OUTPUT / DIRECTION
+Row 2 : MODE / FF / ADAPT× / RAMP °C
+Row 3 : Kp / Ki / Kd entry + APPLY PID button
 """
 
 import tkinter as tk
 from config import (
     PANEL, PANEL2, BORDER, BG,
     ACCENT, ACCENT2, GREEN, TEAL, ORANGE, YLWDK, PURPLE, TEXT_DIM,
-    PID_KP_COOL, PID_KI_COOL, PID_KD_COOL,
-    PID_KP_HEAT, PID_KI_HEAT, PID_KD_HEAT,
+    PID_KP, PID_KI, PID_KD,
 )
 
 
@@ -25,7 +24,7 @@ def build(state, parent, fonts):
     F_STEP = fonts["step"]
     F_PID  = fonts["pid"]
 
-    # ── Row 1: Core PID diagnostics (original) ───────────────────────
+    # ── Row 1: Core PID diagnostics ──────────────────────────────────
     pd = tk.Frame(parent, bg=PANEL)
     pd.pack(fill="x", padx=10, pady=(6, 2))
 
@@ -43,7 +42,7 @@ def build(state, parent, fonts):
     state.pid_out_lbl = _pid_col("OUTPUT (A)", YLWDK,   pd)
     state.pid_dir_lbl = _pid_col("DIRECTION",  GREEN,   pd)
 
-    # ── Row 2: Enhancement diagnostics (new) ─────────────────────────
+    # ── Row 2: Enhancement diagnostics ───────────────────────────────
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
     pe = tk.Frame(parent, bg=PANEL)
     pe.pack(fill="x", padx=10, pady=(3, 2))
@@ -63,58 +62,48 @@ def build(state, parent, fonts):
     # ── Separator ────────────────────────────────────────────────────
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
 
-    # ── Row 3: COOL gains ─────────────────────────────────────────────
-    pt_cool = tk.Frame(parent, bg=PANEL)
-    pt_cool.pack(fill="x", padx=10, pady=(4, 1))
-    tk.Label(pt_cool, text="COOL:", font=F_SM, fg=ACCENT, bg=PANEL).pack(side="left")
+    # ── Row 3: Single gain tuning ─────────────────────────────────────
+    pt = tk.Frame(parent, bg=PANEL)
+    pt.pack(fill="x", padx=10, pady=(4, 4))
+    tk.Label(pt, text="Tune:", font=F_SM, fg=TEXT_DIM, bg=PANEL).pack(side="left")
 
-    def _entry(frame, label, default, color):
-        tk.Label(frame, text=f"  {label}=", font=F_SM,
+    def _entry(label, default, color):
+        tk.Label(pt, text=f"  {label}=", font=F_SM,
                  fg=TEXT_DIM, bg=PANEL).pack(side="left")
-        e = tk.Entry(frame, font=F_ENT, width=6, bg=BG, fg=color,
+        e = tk.Entry(pt, font=F_ENT, width=6, bg=BG, fg=color,
                      relief="solid", highlightbackground=BORDER,
                      highlightthickness=1)
         e.insert(0, str(default))
         e.pack(side="left", padx=2)
         return e
 
-    state.entry_kp = _entry(pt_cool, "Kp", PID_KP_COOL, ACCENT)
-    state.entry_ki = _entry(pt_cool, "Ki", PID_KI_COOL, TEAL)
-    state.entry_kd = _entry(pt_cool, "Kd", PID_KD_COOL, ORANGE)
+    state.entry_kp = _entry("Kp", PID_KP, ACCENT)
+    state.entry_ki = _entry("Ki", PID_KI, TEAL)
+    state.entry_kd = _entry("Kd", PID_KD, ORANGE)
 
-    # ── Row 4: HEAT gains + APPLY button ─────────────────────────────
-    pt_heat = tk.Frame(parent, bg=PANEL)
-    pt_heat.pack(fill="x", padx=10, pady=(1, 4))
-    tk.Label(pt_heat, text="HEAT:", font=F_SM, fg=ORANGE, bg=PANEL).pack(side="left")
-
-    state.entry_kp_heat = _entry(pt_heat, "Kp", PID_KP_HEAT, ACCENT)
-    state.entry_ki_heat = _entry(pt_heat, "Ki", PID_KI_HEAT, TEAL)
-    state.entry_kd_heat = _entry(pt_heat, "Kd", PID_KD_HEAT, ORANGE)
+    # Legacy attrs — kept so other modules don't crash
+    state.entry_kp_heat = state.entry_kp
+    state.entry_ki_heat = state.entry_ki
+    state.entry_kd_heat = state.entry_kd
 
     def apply_pid():
         try:
-            kp_c = float(state.entry_kp.get())
-            ki_c = float(state.entry_ki.get())
-            kd_c = float(state.entry_kd.get())
-            kp_h = float(state.entry_kp_heat.get())
-            ki_h = float(state.entry_ki_heat.get())
-            kd_h = float(state.entry_kd_heat.get())
-
-            state.pid.set_cool_gains(kp_c, ki_c, kd_c)
-            state.pid.set_heat_gains(kp_h, ki_h, kd_h)
+            kp = float(state.entry_kp.get())
+            ki = float(state.entry_ki.get())
+            kd = float(state.entry_kd.get())
+            state.pid.Kp = kp
+            state.pid.Ki = ki
+            state.pid.Kd = kd
             # Keep legacy attrs in sync
-            state.pid.Kp = kp_c
-            state.pid.Ki = ki_c
-            state.pid.Kd = kd_c
-
+            state.pid.Kp_cool = kp; state.pid.Ki_cool = ki; state.pid.Kd_cool = kd
+            state.pid.Kp_heat = kp; state.pid.Ki_heat = ki; state.pid.Kd_heat = kd
             state.pid_tune_lbl.config(
-                text=(f"Applied  COOL Kp={kp_c} Ki={ki_c} Kd={kd_c} | "
-                      f"HEAT Kp={kp_h} Ki={ki_h} Kd={kd_h}"),
+                text=f"Applied: Kp={kp}  Ki={ki}  Kd={kd}",
                 fg=GREEN)
         except ValueError:
             state.pid_tune_lbl.config(text="Invalid values!", fg=ACCENT2)
 
-    tk.Button(pt_heat, text="APPLY PID", font=F_STEP, bg=TEAL, fg="white",
+    tk.Button(pt, text="APPLY PID", font=F_STEP, bg=TEAL, fg="white",
               relief="flat", padx=8, pady=2,
               command=apply_pid).pack(side="left", padx=8)
 

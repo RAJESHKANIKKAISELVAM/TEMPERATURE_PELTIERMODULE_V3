@@ -7,8 +7,8 @@ import os
 # =================================================================
 #  HARDWARE PORTS
 # =================================================================
-TEMP_PORT = "COM8"   # Arduino Uno R3 (DS18B20 + relay)
-PSU_PORT  = "COM7"   # Hanmatek HM310T (Modbus RTU)
+TEMP_PORT = "COM4"   # Arduino Uno R3 (DS18B20 + relay)
+PSU_PORT  = "COM3"   # Hanmatek HM310T (Modbus RTU)
 
 # =================================================================
 #  PSU DEFAULTS

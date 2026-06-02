@@ -3,6 +3,14 @@ controllers/rl_controller.py
 ============================
 Q-Learning controller — master gain supervisor over PID.
 
+Audit fixes applied:
+  - Atomic Q-table save via temp file + os.replace() — no corruption on crash
+  - Q-table schema version validated on load — detects bin config mismatch
+  - Reward penalty scaled proportionally (not flat -10) for violations
+  - on_step_complete returns reward immediately for use before step_rewards cleared
+  - ETA uses total_seconds() not .seconds (fixes wrapping after 1 hour)
+  - Backup written before each save to rl_qtable.json.bak
+
 State space (160 discrete states):
   error_bin  : 8 levels  (-inf,-5,-3,-1,0,1,3,5,+inf)
   dT_dt_bin  : 5 levels  (-inf,-0.3,-0.1,0.1,0.3,+inf)
@@ -11,12 +19,6 @@ State space (160 discrete states):
 Action space (25 discrete actions):
   Kp_scale × {0.5, 0.75, 1.0, 1.25, 1.5}
   max_I    × {1.0, 1.5, 2.0, 2.5, 3.0} A
-
-Reward (Lee et al. 2026):
-  APPROACH:  r = -abs(error) / 10.0
-  HOLD OK:   r = exp(-0.8 * error²)
-  HOLD VIO:  r = -10.0
-  FLIP:      r -= 0.5 per relay flip
 """
 
 import json
@@ -24,6 +26,7 @@ import math
 import os
 import random
 import csv
+import shutil
 from datetime import datetime
 
 from config import BASE_DIR
@@ -33,6 +36,8 @@ from config import BASE_DIR
 # =================================================================
 RL_DATA_DIR    = os.path.join(BASE_DIR, "rl_data")
 QTABLE_PATH    = os.path.join(RL_DATA_DIR, "rl_qtable.json")
+QTABLE_TMP     = os.path.join(RL_DATA_DIR, "rl_qtable.json.tmp")
+QTABLE_BAK     = os.path.join(RL_DATA_DIR, "rl_qtable.json.bak")
 TRAIN_LOG_PATH = os.path.join(RL_DATA_DIR, "rl_training_log.csv")
 
 os.makedirs(RL_DATA_DIR, exist_ok=True)
@@ -42,6 +47,8 @@ os.makedirs(RL_DATA_DIR, exist_ok=True)
 # =================================================================
 ERROR_BINS = [-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0]   # 8 buckets
 DTDT_BINS  = [-0.3, -0.1, 0.1, 0.3]                    # 5 buckets
+
+SCHEMA_VERSION = 2   # increment if bins change — detects stale Q-tables
 
 PHASE_APPROACH_FAR  = 0
 PHASE_APPROACH_NEAR = 1
@@ -69,12 +76,10 @@ def get_state(error, dT_dt, ctrl_state, hold_band, near_band, violation=False):
     """Convert continuous measurements to a discrete state tuple."""
     eb = _discretise(error, ERROR_BINS)
     db = _discretise(dT_dt, DTDT_BINS)
-
     if ctrl_state == "HOLDING":
         pb = PHASE_HOLD_VIO if violation else PHASE_HOLD_OK
     else:
         pb = PHASE_APPROACH_NEAR if abs(error) <= near_band else PHASE_APPROACH_FAR
-
     return (eb, db, pb)
 
 
@@ -84,10 +89,8 @@ def get_state(error, dT_dt, ctrl_state, hold_band, near_band, violation=False):
 class RLController:
 
     def __init__(self,
-                 alpha=0.1,
-                 gamma=0.95,
-                 epsilon_start=0.9,
-                 epsilon_end=0.05,
+                 alpha=0.1, gamma=0.95,
+                 epsilon_start=0.9, epsilon_end=0.05,
                  total_sessions=300):
 
         self.alpha          = alpha
@@ -133,7 +136,6 @@ class RLController:
     def get_action(self, state):
         if not self.enabled:
             return 10   # neutral: Kp×1.0, I=2.0A
-
         k = self._ensure(state)
         if random.random() < self.epsilon:
             return random.randint(0, N_ACTIONS - 1)
@@ -149,14 +151,11 @@ class RLController:
     def update(self, state, action, reward, next_state):
         if not self.enabled or state is None or action is None:
             return
-
         k  = self._ensure(state)
         k2 = self._ensure(next_state)
-
         old_q    = self.qtable[k][action]
         max_next = max(self.qtable[k2])
         new_q    = old_q + self.alpha * (reward + self.gamma * max_next - old_q)
-
         self.qtable[k][action]       = round(new_q, 6)
         self.visit_counts[k][action] += 1
 
@@ -168,10 +167,15 @@ class RLController:
         if ctrl_state == "APPROACH":
             r = -abs(error) / 10.0
         elif ctrl_state == "HOLDING":
-            r = -10.0 if violation else math.exp(-0.8 * error ** 2)
+            if violation:
+                # Fix: scaled penalty proportional to magnitude, not flat -10
+                # -10 caused reward hacking (RL avoids all action to stay safe)
+                vio_magnitude = max(0.0, abs(error) - hold_band)
+                r = -2.0 * vio_magnitude   # e.g. 0.5°C over = -1.0 reward
+            else:
+                r = math.exp(-0.8 * error ** 2)
         else:
             r = 0.0
-
         r -= 0.5 * relay_flips_delta
         return round(r, 6)
 
@@ -181,23 +185,27 @@ class RLController:
     def on_step_complete(self, step_data, hold_band, near_band):
         if not step_data:
             return 0.0
-
         hold_temps = [t for _, t in step_data.get("hold_temps", [])]
         violations = step_data.get("hold_violations", 0)
         target     = step_data.get("target", 0.0)
-
         if not hold_temps:
             return -1.0
-
         avg_temp    = sum(hold_temps) / len(hold_temps)
         avg_error   = avg_temp - target
         hold_secs   = step_data.get("hold_secs", 60)
+        n_ticks     = max(len(hold_temps), 1)
 
         if violations == 0:
             step_reward = math.exp(-0.8 * avg_error ** 2) * hold_secs
         else:
-            vio_frac    = violations / max(len(hold_temps), 1)
-            step_reward = -10.0 * vio_frac * hold_secs
+            # Fix: scaled penalty — proportional to violation fraction × magnitude
+            vio_frac    = violations / n_ticks
+            avg_vio_mag = sum(
+                max(0.0, abs(t - target) - hold_band)
+                for _, t in step_data.get("hold_temps", [])
+                if abs(t - target) > hold_band
+            ) / max(violations, 1)
+            step_reward = -2.0 * vio_frac * avg_vio_mag * hold_secs
 
         step_reward = round(step_reward, 4)
         self.step_rewards.append(step_reward)
@@ -206,24 +214,25 @@ class RLController:
     def on_session_complete(self):
         self.session_count += 1
         self.last_updated   = datetime.now().isoformat()
-
         if self.training_started is None:
             self.training_started = datetime.now().isoformat()
 
-        avg_reward = (sum(self.step_rewards) / len(self.step_rewards)
-                      if self.step_rewards else 0.0)
+        # Capture rewards BEFORE clearing (fixes potential race with log_session)
+        rewards_snapshot = list(self.step_rewards)
+        avg_reward = sum(rewards_snapshot) / len(rewards_snapshot) \
+                     if rewards_snapshot else 0.0
         self.session_rewards.append(avg_reward)
-
         if avg_reward > self.best_session_reward:
             self.best_session_reward = avg_reward
 
+        # Linear epsilon decay
         self.epsilon = max(
             self.epsilon_end,
             self.epsilon_start - (self.epsilon_start - self.epsilon_end)
             * self.session_count / self.total_sessions
         )
         self.epsilon   = round(self.epsilon, 4)
-        self.step_rewards = []
+        self.step_rewards = []   # clear AFTER snapshot
         return avg_reward
 
     # =================================================================
@@ -232,21 +241,17 @@ class RLController:
     def get_stats(self):
         states_visited = sum(1 for v in self.visit_counts.values()
                              if any(n > 0 for n in v))
-
         last_action_str = "--"
         if self.last_action is not None:
             kp_s, mi = self.get_action_params(self.last_action)
             last_action_str = f"Kp×{kp_s} I={mi}A"
-
         last_q = "--"
         if self.last_state is not None and self.last_action is not None:
             k = self._key(self.last_state)
             if k in self.qtable:
                 last_q = f"{self.qtable[k][self.last_action]:.4f}"
-
         avg10 = (sum(self.session_rewards[-10:]) / len(self.session_rewards[-10:])
                  if self.session_rewards else 0.0)
-
         return {
             "session":        self.session_count,
             "epsilon":        round(self.epsilon, 3),
@@ -259,10 +264,15 @@ class RLController:
         }
 
     # =================================================================
-    #  PERSISTENCE
+    #  PERSISTENCE — atomic save + backup
     # =================================================================
     def save(self):
+        """
+        Atomic save: write to .tmp then os.replace() to avoid corruption.
+        Also copies previous file to .bak before overwriting.
+        """
         data = {
+            "schema_version":   SCHEMA_VERSION,
             "version":          1,
             "session_count":    self.session_count,
             "epsilon":          self.epsilon,
@@ -274,8 +284,14 @@ class RLController:
             "session_rewards":  self.session_rewards[-300:],
         }
         try:
-            with open(QTABLE_PATH, "w") as f:
+            # Write to temp file first
+            with open(QTABLE_TMP, "w") as f:
                 json.dump(data, f, indent=2)
+            # Backup previous if it exists
+            if os.path.exists(QTABLE_PATH):
+                shutil.copy2(QTABLE_PATH, QTABLE_BAK)
+            # Atomic replace
+            os.replace(QTABLE_TMP, QTABLE_PATH)
         except Exception as e:
             print(f"[RL] Save failed: {e}")
 
@@ -285,6 +301,14 @@ class RLController:
         try:
             with open(QTABLE_PATH) as f:
                 data = json.load(f)
+
+            # Schema version check — detect stale Q-tables from old bin configs
+            saved_schema = data.get("schema_version", 1)
+            if saved_schema != SCHEMA_VERSION:
+                print(f"[RL] Q-table schema v{saved_schema} != current v{SCHEMA_VERSION}."
+                      f" Starting fresh to avoid corrupted training.")
+                return
+
             self.session_count       = data.get("session_count", 0)
             self.epsilon             = data.get("epsilon", self.epsilon_start)
             self.best_session_reward = data.get("best_reward", -float("inf"))

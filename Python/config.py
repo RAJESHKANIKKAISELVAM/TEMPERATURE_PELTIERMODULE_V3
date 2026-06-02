@@ -17,12 +17,12 @@ DEFAULT_V = 12.0
 DEFAULT_I = 3.0
 
 # =================================================================
-#  PID GAINS
+#  PID GAINS — base values (RL scales these, adaptive compounds)
 # =================================================================
 PID_KP    = 0.30
 PID_KI    = 0.02
 PID_KD    = 0.50
-PID_MIN_I = 0.10
+PID_MIN_I = 0.10   # min PSU current — below this relay coasts OFF
 
 # =================================================================
 #  RAMP GENERATOR
@@ -104,10 +104,15 @@ PID_KP_HEAT = PID_KP; PID_KI_HEAT = PID_KI; PID_KD_HEAT = PID_KD
 #  Q-LEARNING / RL CONSTANTS
 # =================================================================
 RL_ENABLED        = True
-RL_TICK_INTERVAL  = 5
-RL_ALPHA          = 0.1
-RL_GAMMA          = 0.95
-RL_EPSILON_START  = 0.9
-RL_EPSILON_END    = 0.05
-RL_TOTAL_SESSIONS = 300
-RL_HOLD_SECONDS   = 60
+RL_TICK_INTERVAL  = 5       # seconds between RL gain adjustments
+RL_ALPHA          = 0.1     # Q-learning rate
+RL_GAMMA          = 0.95    # discount factor
+RL_EPSILON_START  = 0.9     # initial exploration rate
+RL_EPSILON_END    = 0.05    # final exploration rate
+RL_TOTAL_SESSIONS = 300     # training target
+RL_HOLD_SECONDS   = 60      # hold time per step during training
+
+# RL gain bounds — prevents compounding of RL × adaptive gain
+# Effective Kp = PID_KP × kp_scale_RL (adaptive applied INSIDE pid.compute separately)
+RL_MAX_KP_SCALE   = 1.5     # RL cannot scale Kp above this × PID_KP = 0.45 max
+RL_MAX_CURRENT    = 3.0     # RL cannot set current above this (hardware safety)

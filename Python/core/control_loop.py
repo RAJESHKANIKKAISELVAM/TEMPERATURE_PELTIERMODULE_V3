@@ -1,11 +1,13 @@
 """
 core/control_loop.py — 1 Hz control loop, PID, state machine, PSU poll.
 
-All 15 audit bugs fixed + OCP latch fix + Q-Learning RL integration:
-  - RL adjusts Kp_scale + max_I every RL_TICK_INTERVAL seconds
-  - Q-table updated with reward after each decision
-  - _finalise_step() computes step reward for RL
-  - _done_all() signals runner for next session
+All audit fixes applied:
+  - RL uses pid.set_kp_scale() — prevents base_Kp loss and gain compounding
+  - RL uses smoothed dT_dt from pid._dtdt_smooth (not raw 1Hz noise)
+  - _finalise_step: RL reward computed before step_data.append (correct order)
+  - _done_all: auto_save_all runs in background thread (doesn't block runner)
+  - _done_all: Kp restored via set_kp_scale(1.0) not direct assignment
+  - Hold timer extension uses fixed INTERVAL_MS/1000 (deterministic)
 """
 
 import time
@@ -20,14 +22,11 @@ from config import (
     STEP_ACT, STEP_DONE, STEP_WAIT,
     PREDICT_RELAY_FLIP, PREDICT_SECONDS, PREDICT_MIN_DTDT,
     BRAKE_CHECK_ZONE, BRAKE_CURRENT_SCALE,
-    RL_TICK_INTERVAL, PID_KP, DEFAULT_I,
+    RL_TICK_INTERVAL, RL_MAX_CURRENT,
 )
 from controllers.rl_controller import get_state as rl_get_state
 
 
-# =================================================================
-#  SAFE AFTER
-# =================================================================
 def _safe_after(state, delay, callback, *args):
     if state._shutting_down[0] or state.root is None:
         return
@@ -60,8 +59,7 @@ def start_psu_poll(state):
                         state._psu_was_connected[0] = True
                         _safe_after(state, 0, lambda: (
                             state.psu_dot.config(fg=GREEN),
-                            state.psu_status.config(
-                                text="Connected", fg=GREEN)))
+                            state.psu_status.config(text="Connected", fg=GREEN)))
             else:
                 state._psu_was_connected[0] = True
                 try:
@@ -77,21 +75,31 @@ def start_psu_poll(state):
                     elif idx == 3:
                         f = state.psu.get_protection_status()
                         with state.psu_lock: state.psu_live["protect"] = f
+                        # Auto-clear OCP latch — spawn separate thread
+                        # so poll loop doesn't block on 0.8s sleep
                         if f and state.ctrl["state"] in ("APPROACH", "HOLDING"):
-                            state.psu.output_off()
-                            time.sleep(0.8)
-                            state.psu.set_voltage(
-                                state.ctrl.get("_voltage", 12.0))
-                            state.psu.set_current(
-                                state.ctrl.get("_max_i", 3.0))
-                            state.psu.output_on()
-                            with state.psu_lock:
-                                state.psu_live["protect"] = []
+                            threading.Thread(
+                                target=_clear_ocp, args=(state,),
+                                daemon=True).start()
                 except Exception:
                     pass
                 idx = (idx + 1) % 4
             time.sleep(0.25)
     threading.Thread(target=_poll, daemon=True).start()
+
+
+def _clear_ocp(state):
+    """Called from poll thread on separate thread — clears OCP latch."""
+    try:
+        state.psu.output_off()
+        time.sleep(0.8)
+        state.psu.set_voltage(state.ctrl.get("_voltage", 12.0))
+        state.psu.set_current(state.ctrl.get("_max_i", 3.0))
+        state.psu.output_on()
+        with state.psu_lock:
+            state.psu_live["protect"] = []
+    except Exception:
+        pass
 
 
 # =================================================================
@@ -184,6 +192,13 @@ def _finalise_step(state):
     sd = state._current_step_data[0]
     if sd is None:
         return
+
+    # Fix: compute RL reward BEFORE appending sd to step_data
+    # so on_step_complete reads the correct sd and step_rewards is populated
+    rl_step_reward = 0.0
+    if state.rl.enabled and sd is not None:
+        rl_step_reward = state.rl.on_step_complete(sd, HOLD_BAND, NEAR_BAND)
+
     sd["hold_end_ts"] = time.time()
     if state._active_hold[0] is not None:
         elapsed_end = round(
@@ -200,16 +215,11 @@ def _finalise_step(state):
     state.step_data.append(sd)
     state._current_step_data[0] = None
 
-    # RL: compute step reward from hold quality
-    if state.rl.enabled and sd is not None:
-        state.rl.on_step_complete(sd, HOLD_BAND, NEAR_BAND)
-
 
 # =================================================================
 #  DONE ALL STEPS
 # =================================================================
 def _done_all(state):
-    from core.session import auto_save_all
     state.ctrl["state"] = "DONE"
     state.SESSION_END_DT[0] = datetime.now()
     state.relay.set_off()
@@ -225,23 +235,33 @@ def _done_all(state):
         sl.config(text="✓ DONE", fg=STEP_DONE)
     state.btn_start.config(state="normal")
     state.btn_stop.config(state="disabled")
-    auto_save_all(state)
 
-    # RL: complete episode, save Q-table, signal runner
-    if state.rl.enabled:
-        avg_reward = state.rl.on_session_complete()
-        violations = sum(
-            sd.get("hold_violations", 0) for sd in state.step_data)
-        best_step  = (max(state.rl.step_rewards)
-                      if state.rl.step_rewards else 0.0)
-        state.rl.log_session(avg_reward, violations, best_step)
-        state.rl.save()
-        # Restore base Kp and current limit for next session
-        state.pid.Kp         = PID_KP
-        state.pid.max_output = DEFAULT_I
+    # Fix: auto_save_all in background thread so it doesn't block runner signal
+    def _save_and_signal():
+        from core.session import auto_save_all
+        try:
+            auto_save_all(state)
+        except Exception as e:
+            print(f"[Session] auto_save_all failed: {e}")
 
-    # Signal runner that session is complete
-    state._runner_session_done.set()
+        # RL: complete episode, save Q-table
+        if state.rl.enabled:
+            avg_reward = state.rl.on_session_complete()
+            violations = sum(
+                sd.get("hold_violations", 0) for sd in state.step_data)
+            best_step  = (max(state.rl.step_rewards)
+                          if state.rl.step_rewards else
+                          max(state.rl.session_rewards[-1:] or [0.0]))
+            state.rl.log_session(avg_reward, violations, best_step)
+            state.rl.save()
+            # Fix: restore base Kp via set_kp_scale(1.0) — preserves base_Kp
+            state.pid.set_kp_scale(1.0)
+            state.pid.max_output = state.ctrl.get("_max_i", 3.0)
+
+        # Signal runner — AFTER saves complete
+        state._runner_session_done.set()
+
+    threading.Thread(target=_save_and_signal, daemon=True).start()
 
 
 # =================================================================
@@ -368,14 +388,15 @@ def _check_predictive_flip(state, current_temp, dT_dt, pid_direction,
 def run_pid(state, temp, dt):
     current_A, direction = state.pid.compute(temp, dt)
     diag  = state.pid.get_diagnostics()
-    dT_dt = diag.get("dT_dt", 0.0)
+    # Use smoothed dT_dt for braking and RL (reduces 1Hz noise)
+    dT_dt = state.pid._dtdt_smooth
     now   = time.time()
 
     direction, current_A, braking = _check_predictive_flip(
         state, temp, dT_dt, direction, current_A, now)
     state.pred_braking[0] = braking
 
-    # ── Q-Learning: adjust Kp and max_current every RL_TICK_INTERVAL ─
+    # ── Q-Learning: adjust Kp_scale and max_current every RL_TICK_INTERVAL ─
     state.rl_tick_count[0] += 1
     if state.rl.enabled and state.rl_tick_count[0] % RL_TICK_INTERVAL == 0:
         final_error = temp - state.pid._final_target
@@ -384,19 +405,17 @@ def run_pid(state, temp, dt):
 
         rl_state = rl_get_state(
             error      = final_error,
-            dT_dt      = dT_dt,
+            dT_dt      = dT_dt,   # smoothed
             ctrl_state = state.ctrl["state"],
             hold_band  = HOLD_BAND,
             near_band  = NEAR_BAND,
             violation  = violation,
         )
 
-        # Relay flip delta for reward
         flips_now  = state.pred_flip_count[0]
         flip_delta = max(0, flips_now - state.rl.flip_count_prev)
         state.rl.flip_count_prev = flips_now
 
-        # Compute reward for previous action and update Q-table
         if state.rl.last_state is not None and state.rl.last_action is not None:
             reward = state.rl.compute_reward(
                 error             = final_error,
@@ -408,18 +427,17 @@ def run_pid(state, temp, dt):
             state.rl.update(state.rl.last_state, state.rl.last_action,
                             reward, rl_state)
 
-        # Select new action
-        action_idx       = state.rl.get_action(rl_state)
-        kp_scale, max_i  = state.rl.get_action_params(action_idx)
+        action_idx      = state.rl.get_action(rl_state)
+        kp_scale, max_i = state.rl.get_action_params(action_idx)
 
-        # Apply — bounded by safety limits
-        state.pid.Kp         = round(PID_KP * kp_scale, 4)
-        state.pid.max_output = max_i
+        # Fix: use set_kp_scale() — applies to base_Kp only, no adaptive compounding
+        state.pid.set_kp_scale(kp_scale)
+        # Fix: clamp max_i to RL_MAX_CURRENT hardware safety limit
+        state.pid.max_output = min(max_i, RL_MAX_CURRENT)
 
         state.rl.last_state  = rl_state
         state.rl.last_action = action_idx
 
-        # Refresh RL panel display
         from ui.rl_panel import update_display
         update_display(state)
 
@@ -447,7 +465,6 @@ def run_pid(state, temp, dt):
         state.pid_rmp_lbl.config(
             text=f"{rem:.2f}", fg=_ORG if rem > 0.5 else _TEAL)
 
-    # ── Relay flip ────────────────────────────────────────────────────
     current_dir  = state.relay.get_state()
     first_flip   = (state.ctrl["_last_flip"] == 0.0)
     flip_allowed = first_flip or \
@@ -459,14 +476,12 @@ def run_pid(state, temp, dt):
         else:                  state.relay.set_off()
         state.ctrl["_last_flip"] = now
 
-    # ── PSU current ───────────────────────────────────────────────────
     if current_A > 0 and state.psu.connected:
         try:
             state.psu.set_current(current_A)
         except Exception:
             pass
 
-    # ── GUI: relay ────────────────────────────────────────────────────
     rs        = state.relay.get_state()
     brake_tag = " [BRAKE]" if braking else ""
     relay_colors = {"A": ACCENT, "B": TEAL, "OFF": TEXT_DIM}
@@ -479,12 +494,10 @@ def run_pid(state, temp, dt):
         text=relay_texts.get(rs, "--"),
         fg=ACCENT2 if braking else relay_colors.get(rs, TEXT_DIM))
 
-    # ── GUI: zone ─────────────────────────────────────────────────────
     abs_err = abs(diag["error"])
     if braking:
         state.zone_lbl.config(
-            text=f"ZONE:   BRAKING ×{state.pred_flip_count[0]}",
-            fg=ACCENT2)
+            text=f"ZONE:   BRAKING ×{state.pred_flip_count[0]}", fg=ACCENT2)
     elif abs_err <= 0.3:
         state.zone_lbl.config(text="ZONE:   COAST", fg=TEAL)
     elif abs_err <= HOLD_BAND:
@@ -555,8 +568,7 @@ def update(state):
             pid_out_str = f"{current_A:.3f}A/{direction}{brake_tag}"
 
             if sd is not None:
-                elapsed = round(
-                    now - state.ctrl["_t0"], 2) if state.ctrl["_t0"] else 0
+                elapsed = round(now - state.ctrl["_t0"], 2) if state.ctrl["_t0"] else 0
 
                 if sd["initial_temp"] is None:
                     sd["initial_temp"] = round(temp, 4)
@@ -593,7 +605,8 @@ def update(state):
                             (hold_el, round(temp, 4), deviation))
                         if abs(deviation) > abs(sd["hold_peak_deviation"]):
                             sd["hold_peak_deviation"] = deviation
-                        state.ctrl["hold_end"] += dt
+                        # Fix: deterministic hold extension (not variable dt)
+                        state.ctrl["hold_end"] += INTERVAL_MS / 1000.0
                         if state.hold_dev_lbl is not None:
                             vtype = "OVER" if deviation > 0 else "UNDR"
                             state.hold_dev_lbl.config(
@@ -617,8 +630,7 @@ def update(state):
             if state.ctrl["state"] == "APPROACH" and abs_err <= HOLD_BAND:
                 if sd is not None:
                     sd["approach_end"]  = now
-                    sd["approach_time"] = round(
-                        now - sd["approach_start"], 1)
+                    sd["approach_time"] = round(now - sd["approach_start"], 1)
                     sd["hold_start"]    = now
                 state.ctrl["hold_end"] = now + state.ctrl["hold_secs"]
                 state.ctrl["state"]    = "HOLDING"

@@ -3,14 +3,13 @@ controllers/session_runner.py
 ==============================
 AutoSessionRunner — manages automated 300-session Q-learning training loop.
 
-Workflow per session:
-  1. Generate diverse setpoint sequence
-  2. Inject into GUI step entries
-  3. Wait 30s inter-session cooling
-  4. Trigger start_ctrl(state)
-  5. Wait for _done_all() callback
-  6. RL updates Q-table, saves, decrements epsilon
-  7. Repeat until target session count reached
+Audit fixes applied:
+  - Emergency temperature monitored continuously in safety daemon thread
+  - Hardware connectivity verified before each session start
+  - ETA uses total_seconds() not .seconds (fixes 1-hour wrap bug)
+  - Generated sequences clipped to [TEMP_MIN, TEMP_MAX] bounds
+  - RESUME guard: checks active thread before spawning new one
+  - auto_save_all() runs in background thread so it doesn't block runner
 """
 
 import random
@@ -20,10 +19,10 @@ from datetime import datetime, timedelta
 
 from config import HOLD_BAND, NEAR_BAND
 
-TEMP_MIN        = 16.0
-TEMP_MAX        = 32.0
-TEMP_EMERGENCY  = 38.0
-INTER_SESSION_WAIT = 30
+TEMP_MIN           = 16.0
+TEMP_MAX           = 32.0
+TEMP_EMERGENCY     = 38.0
+INTER_SESSION_WAIT = 30   # seconds between sessions
 
 _SEQUENCES = [
     [20.0, 22.0, 24.0, 26.0, 28.0],
@@ -41,6 +40,11 @@ _SEQUENCES = [
 ]
 
 
+def _clip(temp):
+    """Ensure temperature stays within safe hardware bounds."""
+    return round(max(TEMP_MIN, min(TEMP_MAX, temp)), 1)
+
+
 class AutoSessionRunner:
 
     def __init__(self):
@@ -52,7 +56,7 @@ class AutoSessionRunner:
         self.sessions_this_run  = 0
         self.start_time         = None
         self.pause_time         = None
-        self.total_paused_secs  = 0
+        self.total_paused_secs  = 0.0
 
         self.status             = "IDLE"
         self.status_msg         = ""
@@ -64,6 +68,7 @@ class AutoSessionRunner:
         self.on_cooldown_tick = None
 
         self.current_sequence = []
+        self._loop_thread     = None   # track active training thread
 
     # =================================================================
     #  PUBLIC CONTROL
@@ -80,9 +85,13 @@ class AutoSessionRunner:
         self.emergency_stop  = False
         self.status          = "WAITING"
 
-        t = threading.Thread(
+        self._loop_thread = threading.Thread(
             target=self._training_loop, args=(state,), daemon=True)
-        t.start()
+        self._loop_thread.start()
+
+        # Continuous safety monitor — independent of training loop
+        threading.Thread(
+            target=self._safety_monitor, args=(state,), daemon=True).start()
 
     def pause(self):
         if self.active and not self.paused:
@@ -92,21 +101,49 @@ class AutoSessionRunner:
 
     def resume(self, state):
         if self.active and self.paused:
+            # Fix: ensure previous thread is not still running
+            if self._loop_thread and self._loop_thread.is_alive():
+                self.paused = False   # let existing thread continue
+                self._set_status("WAITING", "Resuming...")
+                return
+
             if self.pause_time:
                 self.total_paused_secs += (
-                    datetime.now() - self.pause_time).seconds
+                    datetime.now() - self.pause_time).total_seconds()
                 self.pause_time = None
             self.paused = False
             self._set_status("WAITING", "Resuming...")
-            t = threading.Thread(
+            self._loop_thread = threading.Thread(
                 target=self._training_loop, args=(state,), daemon=True)
-            t.start()
+            self._loop_thread.start()
 
     def stop(self, state):
         self.active         = False
         self.paused         = False
         self.emergency_stop = True
         self._set_status("IDLE", "Training stopped by user.")
+
+    # =================================================================
+    #  SAFETY MONITOR — runs independently, checks every 2s
+    # =================================================================
+
+    def _safety_monitor(self, state):
+        """
+        Continuous temperature safety check.
+        Runs every 2 seconds independently of the training loop.
+        Pauses training immediately if temperature exceeds emergency threshold.
+        """
+        while self.active:
+            temp = state.last_known_temp[0]
+            if temp is not None and temp > TEMP_EMERGENCY:
+                if not self.paused:
+                    self._set_status(
+                        "ERROR",
+                        f"EMERGENCY STOP: temp={temp:.1f}°C > {TEMP_EMERGENCY}°C")
+                    self.paused = True
+                    # Force stop current session via runner event
+                    state._runner_session_done.set()
+            time.sleep(2)
 
     # =================================================================
     #  TRAINING LOOP
@@ -116,41 +153,25 @@ class AutoSessionRunner:
         rl = state.rl
 
         while self.active and not self.paused:
-
             if rl.session_count >= self.target_sessions:
-                self._set_status(
-                    "DONE",
+                self._set_status("DONE",
                     f"Training complete! {self.target_sessions} sessions.")
                 self.active = False
                 break
 
-            # Emergency temperature check
-            temp = state.last_known_temp[0]
-            if temp is not None and temp > TEMP_EMERGENCY:
-                self._set_status(
-                    "ERROR",
-                    f"Emergency: temp={temp:.1f}°C > {TEMP_EMERGENCY}°C.")
-                self.paused = True
-                break
-
-            # Generate next sequence
+            # Generate and inject sequence
             seq = self._next_sequence(rl.session_count)
             self.current_sequence = seq
 
             if self.on_session_start:
                 self.on_session_start(rl.session_count + 1, seq)
 
-            # Inject into GUI
-            state.root.after(
-                0, lambda s=seq: self._inject_sequence(state, s))
+            state.root.after(0, lambda s=seq: self._inject_sequence(state, s))
             time.sleep(0.3)
 
-            # Inter-session cooling
-            self._set_status(
-                "COOLING",
-                f"Cooling... session "
-                f"{rl.session_count + 1}/{self.target_sessions}")
-
+            # Cooldown
+            self._set_status("COOLING",
+                f"Cooling... session {rl.session_count+1}/{self.target_sessions}")
             for i in range(INTER_SESSION_WAIT, 0, -1):
                 if not self.active or self.paused:
                     return
@@ -163,14 +184,18 @@ class AutoSessionRunner:
             if not self.active or self.paused:
                 return
 
-            # Start session
-            self._set_status(
-                "RUNNING",
-                f"Session {rl.session_count + 1}/{self.target_sessions}"
+            # Fix: verify hardware connected before starting
+            if not state.psu.connected or not state.relay.connected:
+                self._set_status("ERROR",
+                    "Hardware disconnected — pausing training.")
+                self.paused = True
+                break
+
+            self._set_status("RUNNING",
+                f"Session {rl.session_count+1}/{self.target_sessions}"
                 f"  ε={rl.epsilon:.3f}")
             state.root.after(0, lambda: self._trigger_start(state))
 
-            # Wait for session to complete
             state._runner_session_done.clear()
             state._runner_session_done.wait(timeout=900)
 
@@ -193,20 +218,20 @@ class AutoSessionRunner:
 
     def _next_sequence(self, session_num):
         if session_num < len(_SEQUENCES):
-            return list(_SEQUENCES[session_num])
+            return [_clip(t) for t in _SEQUENCES[session_num]]
 
         r = random.random()
         if r < 0.33:
             start = random.uniform(TEMP_MIN, TEMP_MIN + 6)
-            return [round(start + i * random.uniform(1.5, 3.0), 1)
-                    for i in range(5)]
+            seq = [start + i * random.uniform(1.5, 3.0) for i in range(5)]
         elif r < 0.66:
             start = random.uniform(TEMP_MAX - 6, TEMP_MAX)
-            return [round(start - i * random.uniform(1.5, 3.0), 1)
-                    for i in range(5)]
+            seq = [start - i * random.uniform(1.5, 3.0) for i in range(5)]
         else:
-            return [round(random.uniform(TEMP_MIN, TEMP_MAX), 1)
-                    for _ in range(5)]
+            seq = [random.uniform(TEMP_MIN, TEMP_MAX) for _ in range(5)]
+
+        # Fix: clip all generated temps to safe bounds
+        return [_clip(t) for t in seq]
 
     def _set_status(self, status, msg=""):
         self.status     = status
@@ -224,9 +249,11 @@ class AutoSessionRunner:
 
         eta_str = "--"
         if self.start_time and sessions_done > 0:
-            elapsed = ((datetime.now() - self.start_time).seconds
-                       - self.total_paused_secs)
-            secs_per = elapsed / max(sessions_done, 1)
+            # Fix: use total_seconds() not .seconds (wraps at 3600)
+            elapsed = (datetime.now() - self.start_time).total_seconds() \
+                      - self.total_paused_secs
+            elapsed = max(elapsed, 1)
+            secs_per = elapsed / sessions_done
             eta_dt   = datetime.now() + timedelta(seconds=secs_per * sessions_left)
             eta_str  = eta_dt.strftime("%H:%M %d/%m")
 

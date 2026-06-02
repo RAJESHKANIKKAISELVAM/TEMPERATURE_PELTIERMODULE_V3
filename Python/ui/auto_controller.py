@@ -2,16 +2,7 @@
 ui/auto_controller.py
 ======================
 Card 4 — Peltier Auto Controller: 5 sequential setpoints.
-
-Left side : table of target °C + hold seconds + status per step
-Right side: controller status box (state, relay, zone, hold timer, step, target)
-Bottom    : START / STOP buttons
-
-Widget refs stored on state:
-    state.step_entries  — list of (target_entry, hold_entry, status_label)
-    state.state_lbl, state.relay_lbl, state.zone_lbl
-    state.hold_lbl, state.step_lbl, state.target_lbl
-    state.btn_start, state.btn_stop
+RL Training controls embedded inside the CONTROLLER STATUS box.
 """
 
 import tkinter as tk
@@ -19,23 +10,13 @@ from config import (
     PANEL, PANEL2, BORDER, BG,
     ACCENT, ACCENT2, GREEN, TEAL, ORANGE, TEXT_DIM, TEXT_MAIN,
     STEP_ACT, STEP_DONE, STEP_WAIT,
-    NUM_STEPS,
+    NUM_STEPS, PURPLE, YLWDK,
 )
 
-
-# Default setpoints shown in the table at startup
 _DEFAULTS = [(25.0, 60), (22.0, 60), (20.0, 60), (18.0, 60), (16.0, 60)]
 
 
 def build(state, parent, fonts):
-    """
-    Build Card 4 and store widget refs on state.
-
-    Parameters:
-        state  : AppState
-        parent : tk.Frame — the card content frame
-        fonts  : dict of font objects
-    """
     F_SM    = fonts["sm"]
     F_LBL   = fonts["lbl"]
     F_ENT   = fonts["ent"]
@@ -116,11 +97,142 @@ def build(state, parent, fonts):
         lbl.pack(anchor="w", padx=10, pady=1)
         return lbl
 
-    state.state_lbl  = _status_lbl("◉  IDLE",    TEXT_DIM, font=F_STATE)
-    state.relay_lbl  = _status_lbl("RELAY:  OFF", TEXT_DIM)
-    state.zone_lbl   = _status_lbl("ZONE:   --",  TEXT_DIM)
-    state.hold_lbl   = _status_lbl("HOLD:   --",  GREEN)
-    state.step_lbl   = _status_lbl("STEP:   --",  TEAL)
-    state.target_lbl = tk.Label(stbox, text="TARGET: --", font=F_SM,
-                                fg=TEAL, bg=PANEL2)
-    state.target_lbl.pack(anchor="w", padx=10, pady=(1, 8))
+    state.state_lbl    = _status_lbl("◉  IDLE",    TEXT_DIM, font=F_STATE)
+    state.relay_lbl    = _status_lbl("RELAY:  OFF", TEXT_DIM)
+    state.zone_lbl     = _status_lbl("ZONE:   --",  TEXT_DIM)
+    state.hold_lbl     = _status_lbl("HOLD:   --",  GREEN)
+    state.hold_dev_lbl = _status_lbl("DEV:    --",  TEXT_DIM)
+    state.step_lbl     = _status_lbl("STEP:   --",  TEAL)
+    state.target_lbl   = tk.Label(stbox, text="TARGET: --", font=F_SM,
+                                   fg=TEAL, bg=PANEL2)
+    state.target_lbl.pack(anchor="w", padx=10, pady=(1, 4))
+
+    # ── RL Training compact panel ─────────────────────────────────────
+    tk.Frame(stbox, bg=BORDER, height=1).pack(fill="x", padx=4)
+
+    rl_hdr = tk.Frame(stbox, bg=PANEL2)
+    rl_hdr.pack(fill="x", padx=4, pady=(3, 1))
+    tk.Label(rl_hdr, text="Q-LEARNING", font=F_STEP,
+             fg=PURPLE, bg=PANEL2).pack(side="left")
+
+    state.rl_toggle_var = tk.BooleanVar(value=True)
+
+    def _toggle_rl():
+        state.rl.enabled = state.rl_toggle_var.get()
+        col   = GREEN if state.rl.enabled else ACCENT2
+        label = "RL:ON" if state.rl.enabled else "RL:OFF"
+        state.rl_toggle_btn.config(text=label, fg=col)
+
+    state.rl_toggle_btn = tk.Button(
+        rl_hdr, text="RL:ON", font=F_STEP,
+        fg=GREEN, bg=PANEL2, relief="flat", command=_toggle_rl)
+    state.rl_toggle_btn.pack(side="right")
+
+    # Progress row
+    pr = tk.Frame(stbox, bg=PANEL2)
+    pr.pack(fill="x", padx=4, pady=1)
+    state.rl_progress_lbl = tk.Label(pr, text="Session: 0/300",
+                                      font=F_STEP, fg=PURPLE, bg=PANEL2)
+    state.rl_progress_lbl.pack(side="left")
+    state.rl_eta_lbl = tk.Label(pr, text="ETA:--",
+                                 font=F_STEP, fg=TEXT_DIM, bg=PANEL2)
+    state.rl_eta_lbl.pack(side="right")
+
+    # Stats row
+    sr = tk.Frame(stbox, bg=PANEL2)
+    sr.pack(fill="x", padx=4, pady=1)
+    state.rl_eps_lbl    = tk.Label(sr, text="ε:0.900",
+                                    font=F_STEP, fg=ORANGE, bg=PANEL2)
+    state.rl_reward_lbl = tk.Label(sr, text="R:--",
+                                    font=F_STEP, fg=GREEN,  bg=PANEL2)
+    state.rl_action_lbl = tk.Label(sr, text="A:--",
+                                    font=F_STEP, fg=PURPLE, bg=PANEL2)
+    state.rl_eps_lbl.pack(side="left",   padx=2)
+    state.rl_reward_lbl.pack(side="left", padx=2)
+    state.rl_action_lbl.pack(side="left", padx=2)
+
+    # Unused attrs — expected by rl_panel.update_display
+    state.rl_pct_lbl    = None
+    state.rl_pb_canvas  = None
+    state.rl_states_lbl = None
+    state.rl_q_lbl      = None
+
+    # Status + cooldown
+    state.rl_status_lbl = tk.Label(
+        stbox, text="◉ IDLE — press START TRAINING",
+        font=F_STEP, fg=TEXT_DIM, bg=PANEL2)
+    state.rl_status_lbl.pack(anchor="w", padx=8, pady=(1, 1))
+
+    state.rl_cooldown_lbl = tk.Label(stbox, text="",
+                                      font=F_STEP, fg=ORANGE, bg=PANEL2)
+    state.rl_cooldown_lbl.pack(anchor="w", padx=8)
+
+    # RL Buttons
+    rb = tk.Frame(stbox, bg=PANEL2)
+    rb.pack(fill="x", padx=4, pady=(2, 6))
+
+    def _start_training():
+        if not state.runner.active:
+            state.runner.start_training(
+                state, target_sessions=300, hold_seconds=60)
+            state.rl_start_btn.config(state="disabled")
+            state.rl_pause_btn.config(state="normal")
+            state.rl_stop_btn.config(state="normal")
+
+    def _pause_training():
+        if state.runner.active and not state.runner.paused:
+            state.runner.pause()
+            state.rl_pause_btn.config(
+                text="RESUME", command=_resume_training)
+
+    def _resume_training():
+        if state.runner.paused:
+            state.runner.resume(state)
+            state.rl_pause_btn.config(
+                text="PAUSE", command=_pause_training)
+
+    def _stop_training():
+        state.runner.stop(state)
+        state.rl.save()
+        state.rl_start_btn.config(state="normal")
+        state.rl_pause_btn.config(
+            state="disabled", text="PAUSE", command=_pause_training)
+        state.rl_stop_btn.config(state="disabled")
+        state.rl_status_lbl.config(
+            text="◉ STOPPED — Q-table saved", fg=ACCENT2)
+
+    state.rl_start_btn = tk.Button(
+        rb, text="▶ START TRAINING", font=F_STEP,
+        bg=PURPLE, fg="white", relief="flat", padx=6, pady=2,
+        command=_start_training)
+    state.rl_start_btn.pack(side="left", padx=(0, 3))
+
+    state.rl_pause_btn = tk.Button(
+        rb, text="PAUSE", font=F_STEP,
+        bg=ORANGE, fg="white", relief="flat", padx=6, pady=2,
+        state="disabled", command=_pause_training)
+    state.rl_pause_btn.pack(side="left", padx=3)
+
+    state.rl_stop_btn = tk.Button(
+        rb, text="■ STOP", font=F_STEP,
+        bg=ACCENT2, fg="white", relief="flat", padx=6, pady=2,
+        state="disabled", command=_stop_training)
+    state.rl_stop_btn.pack(side="left", padx=3)
+
+    # Wire runner callbacks
+    def _on_status_change(status, msg):
+        color_map = {
+            "RUNNING": GREEN, "COOLING": ORANGE, "WAITING": TEAL,
+            "PAUSED":  ORANGE, "DONE":   GREEN,  "ERROR":   ACCENT2,
+            "IDLE":    TEXT_DIM,
+        }
+        col = color_map.get(status, TEXT_DIM)
+        state.root.after(0, lambda: state.rl_status_lbl.config(
+            text=f"◉ {status} — {msg}", fg=col))
+
+    def _on_cooldown_tick(secs):
+        state.root.after(0, lambda: state.rl_cooldown_lbl.config(
+            text=f"Next session in {secs}s..." if secs > 0 else ""))
+
+    state.runner.on_status_change = _on_status_change
+    state.runner.on_cooldown_tick = _on_cooldown_tick

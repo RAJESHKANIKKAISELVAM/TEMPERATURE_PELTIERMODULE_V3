@@ -2,12 +2,6 @@
 core/app_state.py
 =================
 AppState — single object that holds ALL shared state for the application.
-
-Every module receives an AppState instance. Nothing is a bare global.
-
-Changes from audit:
-  - last_known_temp added (Bug 14 fix — reuse last reading if buffer empty)
-  - hold_dev_lbl added (deviation display during HOLDING)
 """
 
 import threading
@@ -17,8 +11,12 @@ from config import (
     DEFAULT_V, DEFAULT_I,
     PID_KP, PID_KI, PID_KD, PID_MIN_I,
     TEMP_PORT, PSU_PORT,
+    RL_ENABLED, RL_ALPHA, RL_GAMMA,
+    RL_EPSILON_START, RL_EPSILON_END, RL_TOTAL_SESSIONS,
 )
 from controllers import HM310T, RelayController, PIDController
+from controllers.rl_controller  import RLController
+from controllers.session_runner import AutoSessionRunner
 
 
 class AppState:
@@ -37,7 +35,7 @@ class AppState:
 
         # ── Control state ─────────────────────────────────────────────
         self.ctrl = {
-            "state":      "IDLE",   # IDLE | APPROACH | HOLDING | DONE
+            "state":      "IDLE",
             "step":       0,
             "target":     0.0,
             "hold_secs":  0,
@@ -67,11 +65,9 @@ class AppState:
         # ── Research / step data ──────────────────────────────────────
         self.step_data          = []
         self._current_step_data = [None]
-
-        # Hold region markers for temperature graph shading
-        self.hold_regions  = []
-        self._active_hold  = [None]
-        self._hold_artists = []
+        self.hold_regions       = []
+        self._active_hold       = [None]
+        self._hold_artists      = []
 
         # ── Session ───────────────────────────────────────────────────
         self.SESSION_DIR      = [None]
@@ -85,15 +81,34 @@ class AppState:
         self.log_rows           = []
         self._last_update_t     = [time.time()]
         self._psu_was_connected = [False]
+        self._after_id          = [None]
+        self._shutting_down     = [False]
 
-        # Bug 14 fix: cache last valid temperature reading
-        # Used when Arduino serial buffer is empty (no new line yet)
-        # Prevents entire 1Hz tick being skipped due to empty buffer
+        # Last valid temperature reading cache
         self.last_known_temp = [None]
 
         # Predictive relay flip state
         self.pred_braking    = [False]
         self.pred_flip_count = [0]
+
+        # ── Q-Learning RL master controller ──────────────────────────
+        self.rl = RLController(
+            alpha          = RL_ALPHA,
+            gamma          = RL_GAMMA,
+            epsilon_start  = RL_EPSILON_START,
+            epsilon_end    = RL_EPSILON_END,
+            total_sessions = RL_TOTAL_SESSIONS,
+        )
+        self.rl.enabled = RL_ENABLED
+
+        # Automated session runner
+        self.runner = AutoSessionRunner()
+
+        # Event used by runner to detect session completion
+        self._runner_session_done = threading.Event()
+
+        # RL tick counter — RL makes decisions every RL_TICK_INTERVAL seconds
+        self.rl_tick_count = [0]
 
         # ── UI widget references ──────────────────────────────────────
 
@@ -110,10 +125,10 @@ class AppState:
         self.psu_prot    = None
 
         # psu_controls.py
-        self.entry_v    = None
-        self.entry_i    = None
-        self.setpt_lbl  = None
-        self.btn_out    = None
+        self.entry_v   = None
+        self.entry_i   = None
+        self.setpt_lbl = None
+        self.btn_out   = None
 
         # pid_panel.py
         self.pid_err_lbl   = None
@@ -139,12 +154,30 @@ class AppState:
         self.relay_lbl    = None
         self.zone_lbl     = None
         self.hold_lbl     = None
-        self.hold_dev_lbl = None   # deviation label during HOLDING
+        self.hold_dev_lbl = None
         self.step_lbl     = None
         self.target_lbl   = None
         self.btn_start    = None
         self.btn_stop     = None
         self.step_entries = []
+
+        # rl_panel widgets (built inside auto_controller status box)
+        self.rl_progress_lbl = None
+        self.rl_pct_lbl      = None
+        self.rl_eta_lbl      = None
+        self.rl_pb_canvas    = None
+        self.rl_eps_lbl      = None
+        self.rl_reward_lbl   = None
+        self.rl_states_lbl   = None
+        self.rl_action_lbl   = None
+        self.rl_q_lbl        = None
+        self.rl_status_lbl   = None
+        self.rl_cooldown_lbl = None
+        self.rl_start_btn    = None
+        self.rl_pause_btn    = None
+        self.rl_stop_btn     = None
+        self.rl_toggle_btn   = None
+        self.rl_toggle_var   = None
 
         # log_panel.py
         self.log_box  = None
@@ -170,5 +203,5 @@ class AppState:
         self.btn_live     = None
         self.ani          = None
 
-        # root window — set by lab_monitor.py
+        # root window
         self.root = None

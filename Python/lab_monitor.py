@@ -235,13 +235,20 @@ btn_tools.pack(side="right", padx=(0, 8), pady=5)
 #  START BACKGROUND THREADS + MAIN LOOP
 # =================================================================
 start_psu_poll(state)
-root.after(INTERVAL_MS, lambda: update(state))
+state._after_id[0] = root.after(INTERVAL_MS, update, state)
 
 
 # =================================================================
 #  SHUTDOWN
 # =================================================================
 def on_close():
+    state._shutting_down[0] = True
+    if state._after_id[0] is not None:
+        try:
+            root.after_cancel(state._after_id[0])
+        except Exception:
+            pass
+        state._after_id[0] = None
     state.ctrl["state"] = "IDLE"
     try:
         state.ani.event_source.stop()

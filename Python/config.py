@@ -45,7 +45,7 @@ FF_GAIN = 0.05
 #  PREDICTIVE RELAY BRAKING
 # =================================================================
 PREDICT_RELAY_FLIP  = False
-PREDICT_SECONDS     = 8
+PREDICT_SECONDS     = 5
 PREDICT_MIN_DTDT    = 0.10
 BRAKE_CHECK_ZONE    = 6.0
 BRAKE_CURRENT_SCALE = 0.5
@@ -55,7 +55,7 @@ BRAKE_CURRENT_SCALE = 0.5
 # =================================================================
 HOLD_BAND          = 1.0
 NEAR_BAND          = 3.0
-MIN_RELAY_FLIP_SEC = 5.0
+MIN_RELAY_FLIP_SEC = 2.0
 
 # =================================================================
 #  GUI / LOGGING
@@ -104,7 +104,7 @@ PID_KP_HEAT = PID_KP; PID_KI_HEAT = PID_KI; PID_KD_HEAT = PID_KD
 #  Q-LEARNING / RL CONSTANTS
 # =================================================================
 RL_ENABLED        = True
-RL_TICK_INTERVAL  = 5       # seconds between RL gain adjustments
+RL_TICK_INTERVAL  = 1       # seconds between RL gain adjustments
 RL_ALPHA          = 0.1     # Q-learning rate
 RL_GAMMA          = 0.95    # discount factor
 RL_EPSILON_START  = 0.9     # initial exploration rate
@@ -116,3 +116,7 @@ RL_HOLD_SECONDS   = 60      # hold time per step during training
 # Effective Kp = PID_KP × kp_scale_RL (adaptive applied INSIDE pid.compute separately)
 RL_MAX_KP_SCALE   = 1.5     # RL cannot scale Kp above this × PID_KP = 0.45 max
 RL_MAX_CURRENT    = 3.0     # RL cannot set current above this (hardware safety)
+# =================================================================
+#  TRAINING MODE — skip heavy exports (PDF/PNG) during 300 sessions
+# =================================================================
+TRAINING_MODE_LITE_SAVE = True   # set False to re-enable full exports

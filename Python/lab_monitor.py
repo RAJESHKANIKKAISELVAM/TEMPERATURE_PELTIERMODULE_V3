@@ -149,13 +149,13 @@ psu_controls.build(
     card(left, "PSU SET-POINTS  (set before START — locked during run)", row=1),
     fonts)
 
-pid_panel.build(
-    state, card(left, "PID CONTROLLER — LIVE DIAGNOSTICS", row=2), fonts)
-
 auto_controller.build(
     state,
-    card(left, "PELTIER AUTO CONTROLLER — 5 SEQUENTIAL SETPOINTS", row=3),
+    card(left, "PELTIER AUTO CONTROLLER — 5 SEQUENTIAL SETPOINTS", row=2),
     fonts)
+
+pid_panel.build(
+    state, card(left, "PID CONTROLLER — LIVE DIAGNOSTICS", row=3), fonts)
 
 # Card 5 — log gets a raw frame so it can expand
 log_outer = tk.Frame(left, bg=BG)

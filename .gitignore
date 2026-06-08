@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+echo "Python/lab_reports/" >> .gitignore
+echo "Python/rl_data/rl_qtable.json" >> .gitignore
+echo "Python/rl_data/rl_qtable.json.bak" >> .gitignore
+echo "Python/rl_data/rl_qtable.json.tmp" >> .gitignore
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore

@@ -1,7 +1,13 @@
 """
 ui/graphs.py — Right panel: 3 graphs + toolbar (FULL VIEW + LIVE only)
-Oscilloscope style for temperature: uniform bright line, no fade.
-Two live indicator dots — green if within setpoint tolerance, red if not.
+
+Temperature graph: Figure 17 MATLAB style
+  - White background
+  - Line 1 (blue  #1f77b4) — setpoint
+  - Line 2 (red   #d62728) — measured temperature
+  - No dots, no indicators — clean publication style
+
+V/I and PID graphs unchanged (steps-post, dark GRAPH_BG).
 Animation interval 500ms for snappy updates.
 """
 
@@ -12,19 +18,20 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.animation import FuncAnimation
-from matplotlib.patches import Rectangle, Circle
-import matplotlib.patheffects as pe
+from matplotlib.patches import Rectangle
 
 from config import (
     PANEL, PANEL2, BORDER, GRAPH_BG,
     ACCENT, ACCENT2, GREEN, ORANGE, TEAL, PURPLE, YLWDK, TEXT_DIM,
 )
 
-# ── Setpoint tolerance — matches DS18B20 ±0.5°C spec ─────────────────────────
-SETPOINT_TOLERANCE = 0.5   # °C
-
-DOT_ON  = "#22c55e"   # green  — within tolerance
-DOT_OFF = "#ef4444"   # red    — outside tolerance
+# ── Figure 17 style colours (temperature graph only) ─────────────────────────
+FIG17_BG    = "#ffffff"   # white background
+FIG17_GRID  = "#e0e0e0"   # light gray grid
+FIG17_SETP  = "#1f77b4"   # blue  — line 1 setpoint
+FIG17_TEMP  = "#d62728"   # red   — line 2 temperature
+FIG17_TICK  = "#444444"   # axis tick / label colour
+FIG17_SPINE = "#aaaaaa"   # spine colour
 
 
 def build(state, parent, fonts):
@@ -36,54 +43,37 @@ def build(state, parent, fonts):
 
     # ── Figure ───────────────────────────────────────────────────────
     fig = plt.figure(facecolor=GRAPH_BG)
-    gs  = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[2,1,1],
+    gs  = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[2, 1, 1],
                             hspace=0.55, top=0.96, bottom=0.05,
                             left=0.07, right=0.93)
 
-    # ── Temperature graph ────────────────────────────────────────────
+    # ── Temperature graph — Figure 17 MATLAB style ───────────────────
     ax_t = fig.add_subplot(gs[0])
-    ax_t.set_facecolor(GRAPH_BG)
-    ax_t.set_ylabel("Temp (°C)", fontsize=9, color=TEXT_DIM)
-    ax_t.set_xlabel("Time (s)",  fontsize=9, color=TEXT_DIM)
-    ax_t.tick_params(colors=TEXT_DIM, labelsize=8)
-    ax_t.grid(True, color="#d6eaf8", linewidth=0.8, linestyle="--")
-    for s in ax_t.spines.values(): s.set_edgecolor(BORDER)
+    ax_t.set_facecolor(FIG17_BG)
+    ax_t.set_ylabel("Temperature [°C]", fontsize=9, color=FIG17_TICK)
+    ax_t.set_xlabel("Time [s]",         fontsize=9, color=FIG17_TICK)
+    ax_t.tick_params(colors=FIG17_TICK, labelsize=8)
+    ax_t.grid(True, color=FIG17_GRID, linewidth=0.6, linestyle="-")
+    for spine in ax_t.spines.values():
+        spine.set_edgecolor(FIG17_SPINE)
+        spine.set_linewidth(0.8)
 
-    # Oscilloscope style — uniform line, no drawstyle, no fade
-    line_temp, = ax_t.plot([], [], color=ACCENT, lw=1.8,
-                            label="Temperature", zorder=3)
-    line_setp, = ax_t.plot([], [], color=ACCENT2, lw=1.5,
-                            linestyle="--", label="Setpoint", zorder=2)
+    # Line 1 — setpoint (blue, solid)
+    line_setp, = ax_t.plot([], [], color=FIG17_SETP, lw=1.5,
+                            linestyle="-", label="1  setpoint", zorder=2)
 
-    # ── Live indicator dots ──────────────────────────────────────────
-    # dot_temp  → sits on the temperature line at the latest reading
-    # dot_setp  → sits on the setpoint line at the same X position
-    # dot_conn  → dashed connector line between the two dots
-    dot_temp, = ax_t.plot([], [], 'o',
-                           ms=8, zorder=6,
-                           color=DOT_ON,
-                           markerfacecolor=DOT_ON,
-                           markeredgecolor=DOT_ON,
-                           markeredgewidth=1.2)
-
-    dot_setp, = ax_t.plot([], [], 'o',
-                           ms=6, zorder=5,
-                           alpha=0.75,
-                           color=DOT_ON,
-                           markerfacecolor=DOT_ON,
-                           markeredgecolor=DOT_ON,
-                           markeredgewidth=1.2)
-
-    dot_conn, = ax_t.plot([], [],
-                           color=DOT_ON, lw=1.0,
-                           linestyle='--', dashes=(2, 2),
-                           zorder=4, alpha=0.5)
+    # Line 2 — temperature (red, solid)
+    line_temp, = ax_t.plot([], [], color=FIG17_TEMP, lw=1.2,
+                            linestyle="-", label="2  temperature", zorder=3)
 
     ax_t.legend(fontsize=8, loc="upper right",
-                facecolor=PANEL, edgecolor=BORDER)
-    ax_t.set_title("Temperature vs Time", fontsize=9, color=TEXT_DIM, pad=3)
+                facecolor="white", edgecolor=FIG17_SPINE,
+                framealpha=1.0, borderpad=0.5,
+                handlelength=1.8, labelcolor=FIG17_TICK)
+    ax_t.set_title("Temperature vs Time", fontsize=9,
+                   color=FIG17_TICK, pad=3)
 
-    # ── Voltage / Current graph ──────────────────────────────────────
+    # ── Voltage / Current graph (unchanged) ──────────────────────────
     ax_vi = fig.add_subplot(gs[1])
     ax_vi.set_facecolor(GRAPH_BG)
     ax_vi.set_ylabel("Voltage (V)", fontsize=9, color=PURPLE)
@@ -107,7 +97,7 @@ def build(state, parent, fonts):
     ax_vi.set_title("Voltage & Current vs Time", fontsize=9,
                     color=TEXT_DIM, pad=3)
 
-    # ── PID graph ────────────────────────────────────────────────────
+    # ── PID graph (unchanged) ────────────────────────────────────────
     ax_pid = fig.add_subplot(gs[2])
     ax_pid.set_facecolor(GRAPH_BG)
     ax_pid.set_ylabel("PID (A)", fontsize=9, color=TEXT_DIM)
@@ -115,11 +105,11 @@ def build(state, parent, fonts):
     ax_pid.tick_params(colors=TEXT_DIM, labelsize=8)
     ax_pid.grid(True, color="#d6eaf8", linewidth=0.8, linestyle="--")
     for s in ax_pid.spines.values(): s.set_edgecolor(BORDER)
-    line_p, = ax_pid.plot([], [], color=ACCENT,  lw=1.5,
+    line_p, = ax_pid.plot([], [], color=ACCENT, lw=1.5,
                            drawstyle="steps-post", label="P")
-    line_i, = ax_pid.plot([], [], color=TEAL,    lw=1.5,
+    line_i, = ax_pid.plot([], [], color=TEAL,   lw=1.5,
                            drawstyle="steps-post", label="I")
-    line_d, = ax_pid.plot([], [], color=ORANGE,  lw=1.5,
+    line_d, = ax_pid.plot([], [], color=ORANGE, lw=1.5,
                            drawstyle="steps-post", label="D")
     ax_pid.legend(fontsize=8, loc="upper right",
                   facecolor=PANEL, edgecolor=BORDER)
@@ -127,21 +117,18 @@ def build(state, parent, fonts):
                      color=TEXT_DIM, pad=3)
 
     # ── Store on state ───────────────────────────────────────────────
-    state.fig        = fig
-    state.ax_t       = ax_t
-    state.ax_vi      = ax_vi
-    state.ax_vi2     = ax_vi2
-    state.ax_pid     = ax_pid
-    state.line_temp  = line_temp
-    state.line_setp  = line_setp
-    state.line_volt  = line_volt
-    state.line_curr  = line_curr
-    state.line_p     = line_p
-    state.line_i     = line_i
-    state.line_d     = line_d
-    state.dot_temp   = dot_temp
-    state.dot_setp   = dot_setp
-    state.dot_conn   = dot_conn
+    state.fig       = fig
+    state.ax_t      = ax_t
+    state.ax_vi     = ax_vi
+    state.ax_vi2    = ax_vi2
+    state.ax_pid    = ax_pid
+    state.line_temp = line_temp
+    state.line_setp = line_setp
+    state.line_volt = line_volt
+    state.line_curr = line_curr
+    state.line_p    = line_p
+    state.line_i    = line_i
+    state.line_d    = line_d
 
     # ── Canvas ───────────────────────────────────────────────────────
     mpl_canvas = FigureCanvasTkAgg(fig, master=parent)
@@ -229,14 +216,6 @@ def build(state, parent, fonts):
 
     mpl_canvas.mpl_connect("scroll_event", _on_scroll)
 
-    # ── Helper — pick dot colour based on tolerance ──────────────────
-    def _dot_color(temp_val, setp_val):
-        """
-        Green  → temperature is within SETPOINT_TOLERANCE of setpoint.
-        Red    → temperature is outside tolerance (still converging).
-        """
-        return DOT_ON if abs(temp_val - setp_val) <= SETPOINT_TOLERANCE else DOT_OFF
-
     # ── Animation — 500ms catches every 1Hz reading within half second
     def _upd(frame):
         with state.glock:
@@ -266,35 +245,6 @@ def build(state, parent, fonts):
             else:
                 x_min, x_max = ax_t.get_xlim()
 
-            # ── Live indicator dots ───────────────────────────────────
-            if tp and sp:
-                last_t  = tp[-1]
-                last_sp = sp[-1]
-                last_x  = t[-1]
-                color   = _dot_color(last_t, last_sp)
-
-                # Temperature dot — solid, on the temperature line
-                dot_temp.set_data([last_x], [last_t])
-                dot_temp.set_color(color)
-                dot_temp.set_markerfacecolor(color)
-                dot_temp.set_markeredgecolor(color)
-
-                # Setpoint dot — semi-transparent, on the setpoint line
-                dot_setp.set_data([last_x], [last_sp])
-                dot_setp.set_color(color)
-                dot_setp.set_markerfacecolor(color)
-                dot_setp.set_markeredgecolor(color)
-
-                # Connector — dashed line linking the two dots
-                # Only draw if there is a visible gap between them
-                if abs(last_t - last_sp) > 0.05:
-                    dot_conn.set_data([last_x, last_x], [last_t, last_sp])
-                    dot_conn.set_color(color)
-                    dot_conn.set_alpha(0.5)
-                else:
-                    # Dots are on top of each other — hide connector
-                    dot_conn.set_data([], [])
-
             # ── Hold region shading ───────────────────────────────────
             for artists in state._hold_artists:
                 for a in artists:
@@ -316,18 +266,18 @@ def build(state, parent, fonts):
                         (h_start, y_lo),
                         h_end_draw - h_start,
                         y_hi - y_lo,
-                        linewidth=0, facecolor="#1e8449", alpha=0.13,
+                        linewidth=0, facecolor="#1e8449", alpha=0.10,
                         zorder=0, transform=ax_t.transData, clip_on=True)
                     ax_t.add_patch(span)
                     vl_s, = ax_t.plot(
                         [h_start, h_start], [y_lo, y_hi],
-                        color="#1e8449", linestyle="--", linewidth=1.2,
+                        color="#1e8449", linestyle="--", linewidth=1.0,
                         zorder=2, transform=ax_t.transData)
                     vl_e = None
                     if h_end is not None:
                         vl_e, = ax_t.plot(
                             [h_end, h_end], [y_lo, y_hi],
-                            color="#c0392b", linestyle="--", linewidth=1.2,
+                            color="#c0392b", linestyle="--", linewidth=1.0,
                             zorder=2, transform=ax_t.transData)
                     txt = None
                     lx = max(h_start + 0.5, x_min + 0.5)

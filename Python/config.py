@@ -112,11 +112,19 @@ RL_EPSILON_END    = 0.05    # final exploration rate
 RL_TOTAL_SESSIONS = 300     # training target
 RL_HOLD_SECONDS   = 60      # hold time per step during training
 
-# RL gain bounds — prevents compounding of RL × adaptive gain
-# Effective Kp = PID_KP × kp_scale_RL (adaptive applied INSIDE pid.compute separately)
-RL_MAX_KP_SCALE   = 1.5     # RL cannot scale Kp above this × PID_KP = 0.45 max
-RL_MAX_CURRENT    = 3.0     # RL cannot set current above this (hardware safety)
+# RL gain bounds
+RL_MAX_KP_SCALE   = 1.5     # max Kp scale RL can apply
+RL_MAX_CURRENT    = 3.0     # max current RL can command (hardware safety)
+
 # =================================================================
-#  TRAINING MODE — skip heavy exports (PDF/PNG) during 300 sessions
+#  TRAINING MODE — skip heavy exports during 300-session training
 # =================================================================
-TRAINING_MODE_LITE_SAVE = True   # set False to re-enable full exports
+TRAINING_MODE_LITE_SAVE = False  # False = full exports in experiment mode
+
+# =================================================================
+#  RELAY DIRECTION
+#  Set True if temperature moves WRONG direction when heating commanded
+#  i.e. system heats when it should cool and vice versa
+#  This swaps RELAY_A and RELAY_B commands without touching wiring
+# =================================================================
+RELAY_DIRECTION_SWAPPED = True

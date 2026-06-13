@@ -6,9 +6,8 @@ Also reads DS18B20 temperature from the same Arduino.
 
 Audit fixes:
   - Added threading.Lock() for serial port protection
-  - relay.state is now only set after confirmed send (still fire-and-forget
-    but at least protected from concurrent corruption)
-  - _connect() timeout reduced: time.sleep(2) kept (Arduino needs it)
+  - relay.state is now only set after confirmed send
+  - RELAY_DIRECTION_SWAPPED in config.py swaps A/B without rewiring
 """
 
 import serial
@@ -25,7 +24,7 @@ class RelayController:
         self.connected = False
         self.error     = ""
         self.state     = "OFF"
-        self._lock     = threading.Lock()   # Fix: protect serial from concurrent access
+        self._lock     = threading.Lock()
         self._connect()
 
     def _connect(self):
@@ -59,11 +58,26 @@ class RelayController:
             return False
 
     def set_state_a(self):
-        if self._send("RELAY_A"):
+        """
+        Set relay to A direction (cooling by default).
+        If RELAY_DIRECTION_SWAPPED = True in config.py,
+        sends RELAY_B command instead — fixes reversed wiring
+        without any physical hardware change.
+        """
+        from config import RELAY_DIRECTION_SWAPPED
+        cmd = "RELAY_B" if RELAY_DIRECTION_SWAPPED else "RELAY_A"
+        if self._send(cmd):
             self.state = "A"
 
     def set_state_b(self):
-        if self._send("RELAY_B"):
+        """
+        Set relay to B direction (heating by default).
+        If RELAY_DIRECTION_SWAPPED = True in config.py,
+        sends RELAY_A command instead.
+        """
+        from config import RELAY_DIRECTION_SWAPPED
+        cmd = "RELAY_A" if RELAY_DIRECTION_SWAPPED else "RELAY_B"
+        if self._send(cmd):
             self.state = "B"
 
     def set_off(self):

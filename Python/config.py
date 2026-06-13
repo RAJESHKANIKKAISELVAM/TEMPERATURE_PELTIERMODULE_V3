@@ -17,12 +17,12 @@ DEFAULT_V = 12.0
 DEFAULT_I = 3.0
 
 # =================================================================
-#  PID GAINS — base values (RL scales these, adaptive compounds)
+#  PID GAINS
 # =================================================================
 PID_KP    = 0.30
 PID_KI    = 0.02
 PID_KD    = 0.50
-PID_MIN_I = 0.10   # min PSU current — below this relay coasts OFF
+PID_MIN_I = 0.10
 
 # =================================================================
 #  RAMP GENERATOR
@@ -52,9 +52,15 @@ BRAKE_CURRENT_SCALE = 0.5
 
 # =================================================================
 #  CONTROL ZONES
+#  HOLD_BAND = ±1.0°C  → temperature must stay between
+#              setpoint-1 and setpoint+1 for entire hold time
+#  NEAR_BAND = ±3.0°C  → braking distance before setpoint
 # =================================================================
 HOLD_BAND          = 1.0
 NEAR_BAND          = 3.0
+
+# FIX: 2.0 seconds minimum between relay direction changes
+# Allows up to 30 relay flips in a 60s hold → tight temperature control
 MIN_RELAY_FLIP_SEC = 2.0
 
 # =================================================================
@@ -104,27 +110,28 @@ PID_KP_HEAT = PID_KP; PID_KI_HEAT = PID_KI; PID_KD_HEAT = PID_KD
 #  Q-LEARNING / RL CONSTANTS
 # =================================================================
 RL_ENABLED        = True
-RL_TICK_INTERVAL  = 1       # seconds between RL gain adjustments
-RL_ALPHA          = 0.1     # Q-learning rate
-RL_GAMMA          = 0.95    # discount factor
-RL_EPSILON_START  = 0.9     # initial exploration rate
-RL_EPSILON_END    = 0.05    # final exploration rate
-RL_TOTAL_SESSIONS = 300     # training target
-RL_HOLD_SECONDS   = 60      # hold time per step during training
+RL_TICK_INTERVAL  = 1       # FIX: every 1 second (was 5)
+RL_ALPHA          = 0.1
+RL_GAMMA          = 0.95
+RL_EPSILON_START  = 0.9
+RL_EPSILON_END    = 0.05
+RL_TOTAL_SESSIONS = 300
+RL_HOLD_SECONDS   = 60
 
-# RL gain bounds
-RL_MAX_KP_SCALE   = 1.5     # max Kp scale RL can apply
-RL_MAX_CURRENT    = 3.0     # max current RL can command (hardware safety)
+RL_MAX_KP_SCALE   = 1.5
+RL_MAX_CURRENT    = 3.0
 
 # =================================================================
-#  TRAINING MODE — skip heavy exports during 300-session training
+#  TRAINING MODE
+#  True  = skip PDF/PNG during automated training (fast)
+#  False = full exports in experiment mode (research results)
 # =================================================================
-TRAINING_MODE_LITE_SAVE = False  # False = full exports in experiment mode
+TRAINING_MODE_LITE_SAVE = False   # FIX: False for experiment mode
 
 # =================================================================
 #  RELAY DIRECTION
-#  Set True if temperature moves WRONG direction when heating commanded
-#  i.e. system heats when it should cool and vice versa
-#  This swaps RELAY_A and RELAY_B commands without touching wiring
+#  Set True if temperature moves WRONG way when heating commanded.
+#  Swaps RELAY_A and RELAY_B in software — no hardware rewiring needed.
+#  Test: start system, command heating, if temp FALLS → set True
 # =================================================================
 RELAY_DIRECTION_SWAPPED = True

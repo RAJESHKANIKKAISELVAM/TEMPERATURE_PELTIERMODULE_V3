@@ -4,10 +4,10 @@ controllers/relay_controller.py
 Controls the 2-channel relay module via Arduino serial.
 Also reads DS18B20 temperature from the same Arduino.
 
-Audit fixes:
-  - Added threading.Lock() for serial port protection
-  - relay.state is now only set after confirmed send
-  - RELAY_DIRECTION_SWAPPED in config.py swaps A/B without rewiring
+Integration fixes:
+  - RELAY_DIRECTION_SWAPPED: swaps A/B in software if wiring is reversed
+  - threading.Lock() protects serial from concurrent access
+  - read_temperature() returns most recent reading from buffer
 """
 
 import serial
@@ -30,7 +30,7 @@ class RelayController:
     def _connect(self):
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=2)
-            time.sleep(2)   # Arduino resets on serial open — wait for it
+            time.sleep(2)   # Arduino resets on serial open — must wait
             self.connected = True
             self.set_off()
         except Exception as e:
@@ -59,10 +59,9 @@ class RelayController:
 
     def set_state_a(self):
         """
-        Set relay to A direction (cooling by default).
-        If RELAY_DIRECTION_SWAPPED = True in config.py,
-        sends RELAY_B command instead — fixes reversed wiring
-        without any physical hardware change.
+        Command relay to direction A (cooling by default).
+        If RELAY_DIRECTION_SWAPPED = True, sends RELAY_B instead.
+        This fixes reversed H-bridge wiring without touching hardware.
         """
         from config import RELAY_DIRECTION_SWAPPED
         cmd = "RELAY_B" if RELAY_DIRECTION_SWAPPED else "RELAY_A"
@@ -71,9 +70,8 @@ class RelayController:
 
     def set_state_b(self):
         """
-        Set relay to B direction (heating by default).
-        If RELAY_DIRECTION_SWAPPED = True in config.py,
-        sends RELAY_A command instead.
+        Command relay to direction B (heating by default).
+        If RELAY_DIRECTION_SWAPPED = True, sends RELAY_A instead.
         """
         from config import RELAY_DIRECTION_SWAPPED
         cmd = "RELAY_A" if RELAY_DIRECTION_SWAPPED else "RELAY_B"
@@ -81,6 +79,7 @@ class RelayController:
             self.state = "B"
 
     def set_off(self):
+        """Turn both relays off — Peltier coasts."""
         if self._send("RELAY_OFF"):
             self.state = "OFF"
 
@@ -90,8 +89,9 @@ class RelayController:
     def read_temperature(self):
         """
         Read latest temperature from Arduino serial buffer.
-        Thread-safe via lock — prevents corruption with concurrent _send calls.
-        Returns: float | 'ERROR' | None (None = no new data)
+        Returns most recent valid reading (drains buffer).
+        Thread-safe via lock.
+        Returns: float | 'ERROR' | None
         """
         if not self.ser:
             return None
@@ -104,6 +104,7 @@ class RelayController:
                         lines.append(raw)
         except Exception:
             return None
+        # Return most recent valid reading
         for line in reversed(lines):
             if line == "ERROR":
                 return "ERROR"

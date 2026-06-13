@@ -12,7 +12,6 @@ All 15 audit bugs fixed + OCP latch fix:
   - Integral reset on HOLDING entry
   - Graph setpoint records ramp_target not final_target
   - deviation uses pid._final_target consistently
-  - Status labels show value only (prefix shown as static label in GUI)
 """
 
 import time
@@ -71,6 +70,10 @@ def start_psu_poll(state):
                     elif idx == 3:
                         f = state.psu.get_protection_status()
                         with state.psu_lock: state.psu_live["protect"] = f
+                        # Auto-clear OCP/OVP latch via Modbus off→on cycle.
+                        # The HM310T latches protection flags and will NOT
+                        # deliver current until the latch is cleared this way.
+                        # Only clear when system is actively running a step.
                         if f and state.ctrl["state"] in ("APPROACH", "HOLDING"):
                             state.psu.output_off()
                             time.sleep(0.8)
@@ -90,6 +93,10 @@ def start_psu_poll(state):
 #  STEP LOADER
 # =================================================================
 def _load_step(state, idx, current_temp=None):
+    """
+    Load step idx. Pass current_temp from the live measurement tick
+    so ramp seeds from actual temperature, not stale g_temps[-1].
+    """
     if idx >= len(state.ctrl["_steps"]):
         _done_all(state)
         return
@@ -144,7 +151,7 @@ def _load_step(state, idx, current_temp=None):
     state.step_lbl.config(  text=f"{idx+1}/{NUM_STEPS}", fg=TEAL)
     state.target_lbl.config(text=f"{t:.1f}°C",           fg=TEAL)
     state.hold_lbl.config(  text=f"{h}s pending",        fg=TEXT_DIM)
-    state.state_lbl.config( text="◉  APPROACHING",       fg=ACCENT)
+    state.state_lbl.config( text="◉  APPROACHING",               fg=ACCENT)
     state.relay_lbl.config( text="PID deciding...",       fg=TEXT_DIM)
     state.zone_lbl.config(  text="FAR",                   fg=ACCENT)
     if state.hold_dev_lbl is not None:
@@ -155,6 +162,10 @@ def _load_step(state, idx, current_temp=None):
             state.root.after(0, lambda: state.btn_out.config(
                 text="PSU OFF-LINE", bg=ORANGE))
             return
+        # Always output_off first — clears any latched OCP/OVP/OPP
+        # protection flag inside the HM310T firmware before re-enabling.
+        # Without this cycle, the OCP latch stays set permanently and the
+        # Peltier receives zero current even after the fault condition is gone.
         state.psu.output_off()
         time.sleep(0.6)
         state.psu.set_voltage(state.ctrl["_voltage"])
@@ -190,6 +201,7 @@ def _finalise_step(state):
     state.step_data.append(sd)
     state._current_step_data[0] = None
 
+    # RL: compute step reward from hold quality
     if state.rl.enabled and sd is not None:
         state.rl.on_step_complete(sd, HOLD_BAND, NEAR_BAND)
 
@@ -205,10 +217,10 @@ def _done_all(state):
     state.manual_out[0] = False
     threading.Thread(target=state.psu.output_off, daemon=True).start()
     state.btn_out.config(text="OUTPUT: OFF", bg=ACCENT2)
-    state.state_lbl.config( text="◉  ALL DONE ✓",        fg=GREEN)
-    state.relay_lbl.config( text="OFF",                   fg=TEXT_DIM)
-    state.zone_lbl.config(  text="--",                    fg=TEXT_DIM)
-    state.hold_lbl.config(  text="complete ✓",            fg=GREEN)
+    state.state_lbl.config( text="◉  ALL DONE ✓",             fg=GREEN)
+    state.relay_lbl.config( text="OFF",                fg=TEXT_DIM)
+    state.zone_lbl.config(  text="--",                 fg=TEXT_DIM)
+    state.hold_lbl.config(  text="complete ✓",         fg=GREEN)
     state.step_lbl.config(  text=f"{NUM_STEPS}/{NUM_STEPS}", fg=GREEN)
     for _, _, sl in state.step_entries:
         sl.config(text="✓ DONE", fg=STEP_DONE)
@@ -216,16 +228,19 @@ def _done_all(state):
     state.btn_stop.config(state="disabled")
     auto_save_all(state)
 
+    # RL: complete episode, save Q-table, signal runner
     if state.rl.enabled:
         avg_reward  = state.rl.on_session_complete()
         best_step   = max(state.rl.step_rewards) if state.rl.step_rewards else 0.0
         violations  = sum(sd.get("hold_violations", 0) for sd in state.step_data)
         state.rl.log_session(avg_reward, violations, best_step)
         state.rl.save()
+        # Restore base Kp (RL scaling resets each session)
         from config import PID_KP, DEFAULT_I
         state.pid.Kp         = PID_KP
         state.pid.max_output = DEFAULT_I
 
+    # Signal runner that session is done
     state._runner_session_done.set()
 
 
@@ -296,9 +311,9 @@ def stop_ctrl(state):
     state.manual_out[0] = False
     state.btn_out.config(text="OUTPUT: OFF", bg=ACCENT2)
     threading.Thread(target=state.psu.output_off, daemon=True).start()
-    state.state_lbl.config(text="◉  STOPPED", fg=ORANGE)
-    state.relay_lbl.config(text="OFF",         fg=TEXT_DIM)
-    state.zone_lbl.config( text="--",          fg=TEXT_DIM)
+    state.state_lbl.config(text="◉  STOPPED",  fg=ORANGE)
+    state.relay_lbl.config(text="OFF", fg=TEXT_DIM)
+    state.zone_lbl.config( text="--",  fg=TEXT_DIM)
     state.hold_lbl.config( text="--")
     state.step_lbl.config( text="--")
     for _, _, sl in state.step_entries:
@@ -351,7 +366,7 @@ def _check_predictive_flip(state, current_temp, dT_dt, pid_direction,
 # =================================================================
 def run_pid(state, temp, dt):
     current_A, direction = state.pid.compute(temp, dt)
-    diag  = state.pid.get_diagnostics()
+    diag = state.pid.get_diagnostics()
     dT_dt = diag.get("dT_dt", 0.0)
     now   = time.time()
 
@@ -373,29 +388,36 @@ def run_pid(state, temp, dt):
             near_band  = NEAR_BAND,
             violation  = violation,
         )
-        flips_now  = state.pred_flip_count[0]
+        # Get relay flip count delta for reward
+        flips_now = state.pred_flip_count[0]
         flip_delta = flips_now - state.rl.flip_count_prev
         state.rl.flip_count_prev = flips_now
 
+        # Compute reward for previous action
         if state.rl.last_state is not None and state.rl.last_action is not None:
             reward = state.rl.compute_reward(
-                error             = final_error,
-                ctrl_state        = state.ctrl["state"],
-                violation         = violation,
+                error       = final_error,
+                ctrl_state  = state.ctrl["state"],
+                violation   = violation,
                 relay_flips_delta = max(0, flip_delta),
-                hold_band         = HOLD_BAND,
+                hold_band   = HOLD_BAND,
             )
             state.rl.update(state.rl.last_state, state.rl.last_action,
                              reward, rl_state)
 
-        action_idx      = state.rl.get_action(rl_state)
+        # Select new action
+        action_idx = state.rl.get_action(rl_state)
         kp_scale, max_i = state.rl.get_action_params(action_idx)
-        base_kp              = state.pid.Kp
+
+        # Apply — bounded by safety limits
+        base_kp = state.pid.Kp
         state.pid.Kp         = round(base_kp * kp_scale, 4)
         state.pid.max_output = max_i
+
         state.rl.last_state  = rl_state
         state.rl.last_action = action_idx
 
+        # Update RL panel display
         from ui.rl_panel import update_display
         update_display(state)
 
@@ -454,7 +476,7 @@ def run_pid(state, temp, dt):
     abs_err = abs(diag["error"])
     if braking:
         state.zone_lbl.config(
-            text=f"BRAKING x{state.pred_flip_count[0]}", fg=ACCENT2)
+            text=f"BRAKING ×{state.pred_flip_count[0]}", fg=ACCENT2)
     elif abs_err <= 0.3:
         state.zone_lbl.config(text="COAST", fg=TEAL)
     elif abs_err <= HOLD_BAND:
@@ -517,6 +539,9 @@ def update(state):
 
         with state.psu_lock:
             prot_flags = list(state.psu_live["protect"])
+        # Only pause PID for active OVP (real hardware overvoltage danger)
+        # OCP alone is a latched flag — auto-cleared by poll thread above.
+        # Pausing PID on OCP creates a deadlock where latch never clears.
         psu_fault = "OVP" in prot_flags
 
         if state.ctrl["state"] in ("APPROACH", "HOLDING") and not psu_fault:
@@ -561,11 +586,11 @@ def update(state):
                             (hold_el, round(temp, 4), deviation))
                         if abs(deviation) > abs(sd["hold_peak_deviation"]):
                             sd["hold_peak_deviation"] = deviation
-                        state.ctrl["hold_end"] += dt
+                        state.ctrl["hold_end"] += INTERVAL_MS / 1000.0
                         if state.hold_dev_lbl is not None:
                             vtype = "OVER" if deviation > 0 else "UNDR"
                             state.hold_dev_lbl.config(
-                                text=f"{vtype} {deviation:+.3f}°C x{sd['hold_violations']}",
+                                text=f"{vtype} {deviation:+.3f}°C ×{sd['hold_violations']}",
                                 fg=ACCENT2)
                     else:
                         if state.hold_dev_lbl is not None:

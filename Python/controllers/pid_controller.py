@@ -1,15 +1,23 @@
 """
 controllers/pid_controller.py
 =============================
-Single PID controller for Peltier temperature control.
+PID controller for Peltier temperature control.
 
-Audit fixes applied:
-  - integral_limit raised to max_output/Ki = 150 (was 5.0 — disabled I term)
-  - base_Kp stored separately so RL scaling doesn't compound with adaptive gain
-  - P conflict guard fires integral reset only once per episode
-  - FF disabled within HOLD_BAND
-  - Integral reset on HOLDING entry via reset_integral()
-  - dT_dt smoothed via 3-sample EMA to reduce 1Hz sensor noise for RL
+Integration fixes:
+  - integral_limit raised to max_output/Ki = 150
+    (was 5.0 → I term capped at 0.1A, effectively disabled)
+  - This allows I term to build up properly for steady-state correction
+
+Signal separation:
+  ramp_error  = current_temp - ramp_target  → P, I
+  final_error = current_temp - final_target → adaptive, FF, direction
+  dT_dt       = rate of change              → D only
+
+Setpoint accuracy guarantee:
+  - PID direction: positive output → A (cool), negative → B (heat)
+  - Hold band enforced in control_loop.py: ±HOLD_BAND from final_target
+  - Hold timer pauses when temp outside band → exact hold time guaranteed
+  - Integral reset on HOLDING entry → no post-approach overshoot
 """
 
 from config import (
@@ -27,38 +35,29 @@ class PIDController:
                  max_output=3.0, min_output=0.1,
                  integral_limit=None):
 
-        # Base gains — never modified by RL directly
-        # RL scales via _kp_scale; pid.Kp = base_Kp * _kp_scale
-        self.base_Kp     = Kp
-        self.Kp          = Kp
-        self.Ki          = Ki
-        self.Kd          = Kd
-        self._kp_scale   = 1.0   # set by RL controller
+        self.Kp         = Kp
+        self.Ki         = Ki
+        self.Kd         = Kd
+        self.max_output = max_output
+        self.min_output = min_output
 
-        self.max_output  = max_output
-        self.min_output  = min_output
-
-        # Fix: integral_limit = max_output / Ki so anti-windup only fires at saturation
-        # Old value was 5.0 → Ki*5.0 = 0.1A max from I term (effectively disabled)
+        # FIX: integral_limit = max_output/Ki so I term can reach full output
+        # Old value: 5.0 → I capped at Ki×5 = 0.1A (useless)
+        # New value: 3.0/0.02 = 150 → I can reach 3.0A at full windup
+        # Anti-windup back-calculation still prevents runaway
         self.integral_limit = integral_limit if integral_limit is not None \
-                              else max(max_output / max(Ki, 0.001), 10.0)
+                              else max_output / max(Ki, 0.001)
 
-        # Ramp
-        self._final_target  = 0.0
-        self._ramp_target   = 0.0
-        self._ramp_active   = False
-        self.ramp_rate      = RAMP_RATE_DEG_PER_SEC
+        # Ramp generator
+        self._final_target = 0.0
+        self._ramp_target  = 0.0
+        self._ramp_active  = False
+        self.ramp_rate     = RAMP_RATE_DEG_PER_SEC
 
-        # Core PID state
+        # PID state
         self.target         = 0.0
         self._integral      = 0.0
         self._prev_temp     = None
-
-        # dT_dt EMA smoothing (3 samples) — reduces 1Hz DS18B20 noise for RL
-        self._dtdt_history  = []
-        self._dtdt_smooth   = 0.0
-
-        # Anti-windup
         self._was_saturated = False
 
         # Adaptive gain
@@ -95,14 +94,6 @@ class PIDController:
     #  PUBLIC API
     # =================================================================
 
-    def set_kp_scale(self, scale: float):
-        """
-        Called by RL controller to scale Kp.
-        Always applies to base_Kp — prevents RL + adaptive compounding.
-        """
-        self._kp_scale = max(0.1, min(2.0, scale))
-        self.Kp        = round(self.base_Kp * self._kp_scale, 4)
-
     def set_target(self, target: float, current_temp: float = None):
         self._final_target = target
         self._ramp_target  = current_temp if current_temp is not None else target
@@ -116,8 +107,6 @@ class PIDController:
     def reset(self):
         self._integral       = 0.0
         self._prev_temp      = None
-        self._dtdt_history   = []
-        self._dtdt_smooth    = 0.0
         self._was_saturated  = False
         self._in_conflict    = False
         self._conflict_reset = False
@@ -126,19 +115,28 @@ class PIDController:
         self.last_output = self.last_error = self.last_dT_dt = self.last_ff = 0.0
 
     def reset_integral(self):
-        """Called by control_loop on HOLDING entry to clear approach windup."""
+        """Called on HOLDING entry — clears approach windup to prevent overshoot."""
         self._integral      = 0.0
         self._was_saturated = False
 
     def compute(self, current_temp: float, dt: float = 1.0):
         """
         Compute one PID tick.
+
+        Direction mapping (always):
+          output > 0 → direction A → RELAY_A → cooling
+          output < 0 → direction B → RELAY_B → heating
+
+        If relay wiring is physically reversed:
+          Set RELAY_DIRECTION_SWAPPED = True in config.py
+          relay_controller will swap the commands automatically
+
         Returns: (current_A, direction)  direction: 'A'|'B'|'OFF'
         """
         if dt <= 0:
             dt = 1.0
 
-        # ── Advance ramp ──────────────────────────────────────────────
+        # ── Advance ramp ─────────────────────────────────────────────
         if self._ramp_active:
             step = self.ramp_rate * dt
             diff = self._final_target - self._ramp_target
@@ -150,32 +148,21 @@ class PIDController:
 
         self.target         = self._ramp_target
         self.last_ramp_tgt  = round(self._ramp_target, 3)
-        self.ramp_remaining = round(abs(self._final_target - self._ramp_target), 3)
+        self.ramp_remaining = round(
+            abs(self._final_target - self._ramp_target), 3)
 
         # ── Signal separation ─────────────────────────────────────────
         ramp_error  = current_temp - self._ramp_target
         final_error = current_temp - self._final_target
 
-        # Raw dT_dt
-        raw_dtdt = (current_temp - self._prev_temp) / dt \
-                   if self._prev_temp is not None else 0.0
+        dT_dt = (current_temp - self._prev_temp) / dt \
+                if self._prev_temp is not None else 0.0
         self._prev_temp = current_temp
-
-        # 3-sample EMA smoothing for RL state (reduces 1Hz DS18B20 noise)
-        self._dtdt_history.append(raw_dtdt)
-        if len(self._dtdt_history) > 3:
-            self._dtdt_history.pop(0)
-        self._dtdt_smooth = sum(self._dtdt_history) / len(self._dtdt_history)
-
-        self.last_dT_dt = self._dtdt_smooth   # report smoothed version
+        self.last_dT_dt = dT_dt
         self.last_error = ramp_error
         self.last_mode  = "COOL" if final_error > 0 else "HEAT"
 
-        # ── Adaptive gain by |final_error| ────────────────────────────
-        # Uses self.Kp which already includes RL scaling (base_Kp * kp_scale)
-        # Adaptive applies on top — total effective gain bounded by:
-        #   max_effective_Kp = base_Kp × RL_MAX_KP_SCALE × ADAPTIVE_FAR_SCALE
-        #                    = 0.30 × 1.5 × 1.4 = 0.63 A/°C (documented ceiling)
+        # ── Adaptive gain ─────────────────────────────────────────────
         abs_final = abs(final_error)
         if abs_final >= self.adaptive_far_threshold:
             adaptive_scale = self.adaptive_far_scale
@@ -196,9 +183,9 @@ class PIDController:
 
         if conflict_now:
             if not self._in_conflict:
-                self._integral       = 0.0
-                self._was_saturated  = False
-                self._in_conflict    = True
+                self._integral      = 0.0
+                self._was_saturated = False
+                self._in_conflict   = True
             P = 0.0; I = 0.0
             self.last_conflict = True
         else:
@@ -213,8 +200,8 @@ class PIDController:
                                  min(self.integral_limit, self._integral))
             I = self.Ki * self._integral
 
-        # ── D on smoothed dT_dt ───────────────────────────────────────
-        D = Kd * self._dtdt_smooth
+        # ── D term ────────────────────────────────────────────────────
+        D = Kd * dT_dt
 
         self.last_P = round(P, 4)
         self.last_I = round(I, 4)
@@ -229,8 +216,8 @@ class PIDController:
         self.last_ff = round(ff_clamped, 4)
 
         # ── Total output ──────────────────────────────────────────────
-        raw_output       = P + I + D + ff_clamped
-        self.last_output = round(raw_output, 4)
+        raw_output          = P + I + D + ff_clamped
+        self.last_output    = round(raw_output, 4)
         self._was_saturated = abs(raw_output) >= self.max_output
 
         # ── Map to current + direction ────────────────────────────────
@@ -240,9 +227,9 @@ class PIDController:
         if current_A < self.min_output:
             direction = "OFF"; current_A = 0.0
         elif raw_output > 0:
-            direction = "A"
+            direction = "A"    # temp above setpoint → cool
         else:
-            direction = "B"
+            direction = "B"    # temp below setpoint → heat
 
         return current_A, direction
 
@@ -251,16 +238,12 @@ class PIDController:
     # =================================================================
 
     def set_cool_gains(self, Kp, Ki, Kd):
-        self.base_Kp = Kp
-        self.Kp = round(Kp * self._kp_scale, 4)
-        self.Ki = Ki; self.Kd = Kd
+        self.Kp = Kp; self.Ki = Ki; self.Kd = Kd
         self.Kp_cool = Kp; self.Ki_cool = Ki; self.Kd_cool = Kd
         self.Kp_heat = Kp; self.Ki_heat = Ki; self.Kd_heat = Kd
 
     def set_heat_gains(self, Kp, Ki, Kd):
-        self.base_Kp = Kp
-        self.Kp = round(Kp * self._kp_scale, 4)
-        self.Ki = Ki; self.Kd = Kd
+        self.Kp = Kp; self.Ki = Ki; self.Kd = Kd
         self.Kp_cool = Kp; self.Ki_cool = Ki; self.Kd_cool = Kd
         self.Kp_heat = Kp; self.Ki_heat = Ki; self.Kd_heat = Kd
 
@@ -271,8 +254,6 @@ class PIDController:
     def get_diagnostics(self) -> dict:
         return {
             "Kp": self.Kp, "Ki": self.Ki, "Kd": self.Kd,
-            "base_Kp":        self.base_Kp,
-            "kp_scale":       round(self._kp_scale, 3),
             "error":          round(self.last_error, 4),
             "P":              self.last_P,
             "I":              self.last_I,
@@ -285,5 +266,5 @@ class PIDController:
             "ramp_target":    self.last_ramp_tgt,
             "ramp_remaining": self.ramp_remaining,
             "conflict":       self.last_conflict,
-            "Kp_heat": self.base_Kp, "Ki_heat": self.Ki, "Kd_heat": self.Kd,
+            "Kp_heat": self.Kp, "Ki_heat": self.Ki, "Kd_heat": self.Kd,
         }
